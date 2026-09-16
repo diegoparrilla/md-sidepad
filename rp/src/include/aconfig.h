@@ -23,6 +23,7 @@
 #define ACONFIG_PARAM_MOUSE "MOUSE"  // right-stick-as-mouse toggle (persisted)
 #define ACONFIG_PARAM_JOYSTICK "JOYSTICK"  // joystick injection toggle (persisted)
 #define ACONFIG_PARAM_HOOK "HOOK"  // VBL/ETV hook-mode toggle (persisted)
+#define ACONFIG_PARAM_XPAD "XPAD"  // Xpad block/cookie toggle (persisted)
 
 #define ACONFIG_SUCCESS 0
 #define ACONFIG_INIT_ERROR -1

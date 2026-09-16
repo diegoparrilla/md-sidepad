@@ -70,15 +70,20 @@
 // Shared-variable slot carrying the joystick-enabled flag to the m68k, so the
 // exit banner can list what is actually on (LSB at m68k $FA202F). Banner only,
 // unlike slot 5, which the resident hook reads to gate mouse injection: the
-// joystick is gated on this side, by publishing an idle packet. Xpad is always
-// published and so needs no flag.
+// joystick is gated on this side, by publishing an idle packet.
 #define SIDEPAD_JOY_ENABLED_SLOT 7
+
+// Shared-variable slot carrying the Xpad-enabled flag to the m68k (LSB at m68k
+// $FA2033). Read by the userfw installer, which only puts the XPAD cookie in
+// the jar when it is set, and by the exit banner. The block itself is gated on
+// this side, by not publishing it at all.
+#define SIDEPAD_XPAD_ENABLED_SLOT 8
 
 // Right-stick-as-mouse tuning (analog, proportional). Deadzone around centre
 // (0.5) below which the stick is idle, and the max per-frame cursor delta at
 // full deflection. Both are feel parameters to tune on hardware.
 #define SIDEPAD_MOUSE_DEADZONE 0.15f
-#define SIDEPAD_MOUSE_MAX_SPEED 10
+#define SIDEPAD_MOUSE_MAX_SPEED 20
 
 enum {
   APP_MODE_SETUP = 255  // Setup
@@ -163,14 +168,20 @@ static void appendLineAt(char *buffer, size_t bufferSize, size_t *offset,
 #define VIS_TITLE_ROW (DIR_BOX_ROW + DIR_BOX_INNER_H + 3)
 
 // Right-stick-as-mouse toggle ([M] in the controller UI). Persisted to per-app
-// config (ACONFIG_PARAM_MOUSE): loaded at startup and saved on exit to desktop, so
-// the choice survives reboots.
+// config (ACONFIG_PARAM_MOUSE): loaded at startup and saved on exit to desktop,
+// so the choice survives reboots.
 static bool mouseMode = false;
 
 // Joystick injection on/off, toggled with J and persisted like mouse mode.
-// Off still leaves Xpad published: a game reading the block is unaffected by
-// whether we are also pretending to be a joystick.
+// Off does not touch Xpad: a game reading the block is unaffected by whether
+// we are also pretending to be a joystick.
 static bool joystickMode = true;
+
+// Xpad support on/off ([X] in the controller UI), persisted like the others.
+// Off means the block is never published and the m68k installer leaves the
+// XPAD cookie out of the jar, so an Xpad-aware program sees nothing at all;
+// joystick and mouse injection are untouched either way.
+static bool xpadMode = true;
 
 // VBL/ETV hook-mode toggle ([H] in the controller UI). false = VBL ($70), true
 // = ETV ($400). Defaults to ETV (ACONFIG_PARAM_HOOK default is "true"); this
@@ -296,8 +307,8 @@ static void emitToggleTitle(char *updates, size_t *offset, uint8_t dirCol,
             "\x1B"
             "q"
             "%s: %s",
-            (char)(TERM_POS_Y + VIS_TITLE_ROW),
-            (char)(TERM_POS_X + dirCol + 1), key, rest, on ? "on " : "off");
+            (char)(TERM_POS_Y + VIS_TITLE_ROW), (char)(TERM_POS_X + dirCol + 1),
+            key, rest, on ? "on " : "off");
 }
 
 static void renderControllerScreen(const controller_state_t *state,
@@ -406,6 +417,7 @@ static void renderControllerScreen(const controller_state_t *state,
         "P    Pair a new controller",
         "J    Joystick on/off",
         "M    Right stick as mouse on/off",
+        "X    Xpad on/off",
         "H    Toggle joystick hook (see below)",
         "ESC  Exit to desktop and play!",
         "B    Return to Booster",
@@ -414,7 +426,6 @@ static void renderControllerScreen(const controller_state_t *state,
         "",
         "ETV  Works with most apps and games",
         "VBL  Great for GEM and TOS apps",
-        "",
         "",
         "Web  neilrackett.com/atarist",
     };
@@ -518,8 +529,14 @@ static void renderControllerScreen(const controller_state_t *state,
               "H"
               "\x1B"
               "q"
-              "ook:%s ",
-              etvMode ? "ETV" : "VBL");
+              "ook:%s "
+              "\x1B"
+              "p"
+              "X"
+              "\x1B"
+              "q"
+              "pad:%s",
+              etvMode ? "ETV" : "VBL", xpadMode ? "on" : "off");
   }
 
   // Park the cursor block in the empty bottom-right cell so it doesn't sit on
@@ -690,9 +707,9 @@ static bool loadBoolSetting(const char *key, bool absentDefault) {
 }
 
 // Stage one bool for the next save. Deliberately does NOT flush: settings_save
-// erases and reprograms a whole flash sector, so the three toggles are staged
-// and committed once, in saveSettings(), rather than three sectors' worth of
-// erase on the way out to the desktop.
+// erases and reprograms a whole flash sector, so the toggles are staged and
+// committed once, in saveSettings(), rather than a sector's worth of erase
+// apiece on the way out to the desktop.
 static void putBoolSetting(const char *key, bool value) {
   settings_put_bool(aconfig_getContext(), key, value);
 }
@@ -713,6 +730,7 @@ static void exitToGemDesktop(void) {
   putBoolSetting(ACONFIG_PARAM_MOUSE, mouseMode);
   putBoolSetting(ACONFIG_PARAM_JOYSTICK, joystickMode);
   putBoolSetting(ACONFIG_PARAM_HOOK, etvMode);
+  putBoolSetting(ACONFIG_PARAM_XPAD, xpadMode);
   saveSettings();
 
   // The joystick injection hook only matters once a game is running, so install
@@ -739,17 +757,27 @@ static void exitToGemDesktop(void) {
   SET_SHARED_VAR(SIDEPAD_JOY_ENABLED_SLOT, joystickMode ? 1u : 0u,
                  (uint32_t)&__rom_in_ram_start__,
                  CHANDLER_SHARED_VARIABLES_OFFSET);
+  // And the Xpad flag, latched here for the same reason: the installer reads
+  // it on the first CMD_START below to decide whether to put the cookie in the
+  // jar, and X can only be pressed in the terminal we have just left.
+  SET_SHARED_VAR(SIDEPAD_XPAD_ENABLED_SLOT, xpadMode ? 1u : 0u,
+                 (uint32_t)&__rom_in_ram_start__,
+                 CHANDLER_SHARED_VARIABLES_OFFSET);
   // Lay down the Xpad block before the m68k installer runs, because the same
   // CMD_START burst that installs the hook also installs the cookie pointing
   // at it. A consumer that looked before this ran would find a valid cookie
-  // aimed at zeroes.
-  xpadstate_init();
-  xpadstate_publish();
+  // aimed at zeroes. With Xpad off nothing is published at all, and the
+  // installer leaves the cookie out to match, so the window stays as the
+  // cartridge image left it: zeroes, which no consumer accepts as a block.
+  if (xpadMode) {
+    xpadstate_init();
+    xpadstate_publish();
+  }
   for (int i = 0; i < SIDEPAD_HOOK_START_TICKS; i++) {
     SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
     writeBtJoyState();
     writeBtMouseState();  // publish before the hook starts reading slot 5
-    xpadstate_publish();
+    if (xpadMode) xpadstate_publish();
     controller_poll();
     sleep_ms(SLEEP_LOOP_MS);
   }
@@ -767,7 +795,7 @@ static void exitToGemDesktop(void) {
     SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_CONTINUE);
     writeBtJoyState();
     writeBtMouseState();
-    xpadstate_publish();
+    if (xpadMode) xpadstate_publish();
     controller_poll();
     sleep_ms(SLEEP_LOOP_MS);
   }
@@ -778,7 +806,7 @@ static void exitToGemDesktop(void) {
     controller_poll();
     writeBtJoyState();
     writeBtMouseState();
-    xpadstate_publish();
+    if (xpadMode) xpadstate_publish();
     sleep_ms(SIDEPAD_JOY_POLL_MS);
   }
 }
@@ -819,6 +847,14 @@ static void handleUiKeystroke(char keystroke) {
       // joystick port.
       joystickMode = !joystickMode;
       DPRINTF("Joystick mode: %s\n", joystickMode ? "on" : "off");
+      refreshControllerUI(true);
+      break;
+    case 'x':
+      // Toggle Xpad, the same shape as M and J. Joystick and mouse injection
+      // are unaffected; this only decides whether the block and its cookie go
+      // out at all. Full redraw so the footer's Xpad label updates.
+      xpadMode = !xpadMode;
+      DPRINTF("Xpad mode: %s\n", xpadMode ? "on" : "off");
       refreshControllerUI(true);
       break;
     case 'h':
@@ -1070,6 +1106,8 @@ void emul_start() {
   // Absent means a config predating the toggle: keep the joystick.
   joystickMode = loadBoolSetting(ACONFIG_PARAM_JOYSTICK, true);
   etvMode = loadBoolSetting(ACONFIG_PARAM_HOOK, false);
+  // Absent means a config predating the toggle: keep publishing Xpad.
+  xpadMode = loadBoolSetting(ACONFIG_PARAM_XPAD, true);
 
   // 6. Bring up the BLE controller host.
   // Sidepad does not use WiFi: the CYW43 chip is shared between WiFi and

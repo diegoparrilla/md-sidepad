@@ -345,6 +345,7 @@ GEMDOS_Cconws		equ 9						; trap #1 -> print null-terminated string
 EXIT_FLAG_ADDR		equ (SHARED_VARIABLES + (4 * 4) + 3)	; connected flag, LSB of slot 4 ($FA2023)
 MOUSE_ENABLED_ADDR	equ (SHARED_VARIABLES + (5 * 4))		; mouse-mode flag, byte 0 of slot 5 ($FA2024)
 JOY_ENABLED_ADDR	equ (SHARED_VARIABLES + (7 * 4) + 3)	; joystick flag, LSB of slot 7 ($FA202F)
+XPAD_ENABLED_ADDR	equ (SHARED_VARIABLES + (8 * 4) + 3)	; Xpad flag, LSB of slot 8 ($FA2033)
 
 boot_gem:
 	; (Re)install the VBL injection hook before booting to the desktop. boot_gem
@@ -366,38 +367,58 @@ boot_gem:
 	; All banners (VT52 clear + fixed text) live here in ROM (read from the
 	; cartridge, which is readable), so nothing is subject to the unreliable
 	; shared-region string transfer; the RP supplies only the flags that
-	; pick between them: connected (slot 4), mouse (slot 5) and joystick
-	; (slot 7).
+	; pick between them: connected (slot 4), mouse (slot 5), joystick
+	; (slot 7) and Xpad (slot 8).
 	tst.b	EXIT_FLAG_ADDR				; connected?
 	beq.s	.bg_noconn
 
 	; Connected: a fixed header, then the device list on the row below.
-	; Xpad is always first because it is always published: the joystick
-	; and mouse flags only say whether we are additionally pretending to
-	; be those devices. Four combinations, one string each, since picking
-	; between whole strings needs no runtime assembly of text.
+	; Each of the three flags contributes its own fragment, separated by
+	; commas; d3 holds whether one has been printed yet, so the separator
+	; only appears between items. Assembled here rather than picked from
+	; eight fixed strings, which is where a whole-string table stops paying.
+	; d3 is scratch in this file (check_keys uses it the same way) and GEMDOS
+	; preserves d3-d7/a3-a6, so it survives the Cconws calls below.
 	lea	bg_msg_head(pc), a0
 	bsr.s	.bg_write
+	moveq	#0, d3					; nothing printed yet
+	tst.b	XPAD_ENABLED_ADDR
+	beq.s	.bg_noxpad
+	lea	bg_dev_xpad(pc), a0
+	bsr.s	.bg_item
+.bg_noxpad:
 	tst.b	JOY_ENABLED_ADDR
 	beq.s	.bg_nojoy
-	tst.b	MOUSE_ENABLED_ADDR
-	beq.s	.bg_joyonly
-	lea	bg_list_joymouse(pc), a0		; Xpad, joystick, mouse
-	bra.s	.bg_print
-.bg_joyonly:
-	lea	bg_list_joy(pc), a0			; Xpad, joystick
-	bra.s	.bg_print
+	lea	bg_dev_joy(pc), a0
+	bsr.s	.bg_item
 .bg_nojoy:
 	tst.b	MOUSE_ENABLED_ADDR
-	beq.s	.bg_xpadonly
-	lea	bg_list_mouse(pc), a0			; Xpad, mouse
-	bra.s	.bg_print
-.bg_xpadonly:
-	lea	bg_list_xpad(pc), a0			; Xpad
+	beq.s	.bg_nomouse
+	lea	bg_dev_mouse(pc), a0
+	bsr.s	.bg_item
+.bg_nomouse:
+	tst.w	d3
+	bne.s	.bg_tail
+	lea	bg_dev_none(pc), a0			; connected, but every output turned off
+	bsr.s	.bg_write
+.bg_tail:
+	lea	bg_list_end(pc), a0			; close the list line, then a blank one
 	bra.s	.bg_print
 .bg_noconn:
 	lea	bg_msg_noconn(pc), a0			; ESC E + "Sidepad not connected" + blank line
 .bg_print:
+	bsr.s	.bg_write
+	rts
+; One device fragment, preceded by a separator when it is not the first.
+.bg_item:
+	tst.w	d3
+	beq.s	.bg_item_first
+	move.l	a0, -(sp)
+	lea	bg_list_sep(pc), a0
+	bsr.s	.bg_write
+	move.l	(sp)+, a0
+.bg_item_first:
+	moveq	#1, d3
 	bsr.s	.bg_write
 	rts
 .bg_write:
@@ -408,14 +429,18 @@ boot_gem:
 	rts
 bg_msg_head:
 	dc.b	27,"E","MD/Sidepad connected:",13,10,0
-bg_list_xpad:
-	dc.b	"Xpad",13,10,13,10,0
-bg_list_joy:
-	dc.b	"Xpad, joystick",13,10,13,10,0
-bg_list_mouse:
-	dc.b	"Xpad, mouse",13,10,13,10,0
-bg_list_joymouse:
-	dc.b	"Xpad, joystick, mouse",13,10,13,10,0
+bg_dev_xpad:
+	dc.b	"Xpad",0
+bg_dev_joy:
+	dc.b	"joystick",0
+bg_dev_mouse:
+	dc.b	"mouse",0
+bg_dev_none:
+	dc.b	"nothing (all inputs off)",0
+bg_list_sep:
+	dc.b	", ",0
+bg_list_end:
+	dc.b	13,10,13,10,0
 bg_msg_noconn:
 	dc.b	27,"E","MD/Sidepad not connected",13,10,13,10,0
 	even

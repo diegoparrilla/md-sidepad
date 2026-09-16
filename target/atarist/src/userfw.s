@@ -58,6 +58,7 @@ ETV_TIMER_VECTOR    equ $400        ; .l  etv_timer subroutine vector (MFP Timer
 ETV_DIVISOR         equ 4           ; ETV ticks per injection: ~200 Hz / 4 = ~50 Hz (match VBL)
 BT_JOY_BYTE         equ $FA201F     ; LSB of shared-var slot 3 (RP writes it)
 HOOK_FLAG_ADDR      equ $FA202B     ; LSB of shared-var slot 6: 0 = VBL ($70), 1 = ETV ($400)
+XPAD_FLAG_ADDR      equ $FA2033     ; LSB of shared-var slot 8: 1 = publish the Xpad cookie
 ; Mouse packet in shared-var slot 5 ($FA2024), one byte each (RP writes them).
 ; move.l reads the slot big-endian, so byte0 is at the lowest address:
 BT_MOUSE_ENABLED    equ $FA2024     ; mouse mode on (1) / off (0)
@@ -87,7 +88,12 @@ userfw:
     ; Publish the Xpad cookie first. It is independent of everything below:
     ; the block lives in the cartridge window, not in the RAM block, so it
     ; should go in even if the Malloc fails and no hook gets installed.
+    ; Skipped entirely when the RP has Xpad turned off (slot 8): it publishes
+    ; no block then, so a cookie here would point at empty window.
+    tst.b   XPAD_FLAG_ADDR
+    beq.s   .uf_no_xpad
     bsr     install_xpad_cookie
+.uf_no_xpad:
 
     ; Malloc a RAM block for the resident handler + its state.
     move.l  #(resident_end-resident_start), -(sp)
