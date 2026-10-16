@@ -36,11 +36,11 @@ terminal uses are put back before the desktop starts.
 `etv_timer` is called at 50 Hz, not the 200 Hz MD/Sidepad assumed, so
 dividing it by four left ETV mode, the default, updating the joystick
 and mouse only 12.5 times a second. It now injects on every call, the
-same rate as VBL mode on a PAL display. The mouse's top speed is
-retuned to match (5 pixels per update rather than 20, so the same 250
-pixels a second as before in ETV mode, and a quarter of what VBL mode
-gave), and fractions of a pixel carry over between updates so slow
-movement stays smooth.
+same rate as VBL mode on a PAL display. ETV mode's mouse speed is
+retuned to match (5 pixels per update rather than 20, the same 250
+pixels a second as before), VBL mode's is unchanged, and fractions of a
+pixel carry over between updates in both, so slow movement stays
+smooth.
 
 ### Under the hood
 

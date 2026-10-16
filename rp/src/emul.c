@@ -97,12 +97,14 @@
 
 // Right-stick-as-mouse tuning (analog, proportional). Deadzone around centre
 // (0.5) below which the stick is idle, and the cursor's speed at full
-// deflection in pixels per injection: 50 injections a second on ETV, and the
-// display's rate on VBL. Both are feel parameters to tune on hardware. This
-// was 20 while ETV wrongly injected at 12.5 Hz; 5 at 50 Hz keeps that top
-// speed, 250 pixels a second.
+// deflection in pixels per injection, one for each hook. Both are feel
+// parameters, tuned on hardware when both hooks were 20 and ETV wrongly
+// injected at 12.5 Hz. VBL is unchanged: 20 at the display's rate, 1000
+// pixels a second on a 50 Hz display. ETV injects at 50 Hz now, so its 20
+// became 5, the same 250 pixels a second.
 #define SIDEPAD_MOUSE_DEADZONE 0.15f
-#define SIDEPAD_MOUSE_MAX_SPEED 5.0f
+#define SIDEPAD_MOUSE_MAX_SPEED_VBL 20.0f
+#define SIDEPAD_MOUSE_MAX_SPEED_ETV 5.0f
 
 enum {
   APP_MODE_SETUP = 255  // Setup
@@ -743,7 +745,7 @@ static void writeBtJoyState(void) {
 
 // Map a centred analog axis (0..1, 0.5 = rest) to a signed per-frame cursor
 // delta: zero inside the deadzone, then a linear+quadratic blend up to
-// SIDEPAD_MOUSE_MAX_SPEED at full deflection. The blend (0.5*t + 0.5*t^2)
+// maxSpeed at full deflection. The blend (0.5*t + 0.5*t^2)
 // halves the slope near the deadzone edge -> half the minimum speed for finer
 // slow control, while full deflection still reaches the same max.
 //
@@ -755,7 +757,7 @@ static void writeBtJoyState(void) {
 static float mouseCarryX = 0.0f;
 static float mouseCarryY = 0.0f;
 
-static int8_t mouseAxisDelta(float axis, float *carry) {
+static int8_t mouseAxisDelta(float axis, float maxSpeed, float *carry) {
   float off = axis - 0.5f;  // -0.5 .. +0.5
   float mag = off < 0.0f ? -off : off;
   if (mag <= SIDEPAD_MOUSE_DEADZONE) {
@@ -764,7 +766,7 @@ static int8_t mouseAxisDelta(float axis, float *carry) {
   }
   float t = (mag - SIDEPAD_MOUSE_DEADZONE) / (0.5f - SIDEPAD_MOUSE_DEADZONE);
   if (t > 1.0f) t = 1.0f;  // clamp to full deflection
-  float scaled = (0.5f * t + 0.5f * t * t) * SIDEPAD_MOUSE_MAX_SPEED;
+  float scaled = (0.5f * t + 0.5f * t * t) * maxSpeed;
   float v = *carry + (off < 0.0f ? -scaled : scaled);
   int delta = (int)v;  // toward zero; the rest is carried
   *carry = v - (float)delta;
@@ -787,8 +789,10 @@ static void writeBtMouseState(void) {
   // change to the rest state cannot quietly start moving the cursor.
   if (mouseMode && st.connected) {
     enabled = 1;
-    dx = mouseAxisDelta(st.rx, &mouseCarryX);
-    dy = mouseAxisDelta(st.ry, &mouseCarryY);
+    float maxSpeed =
+        etvMode ? SIDEPAD_MOUSE_MAX_SPEED_ETV : SIDEPAD_MOUSE_MAX_SPEED_VBL;
+    dx = mouseAxisDelta(st.rx, maxSpeed, &mouseCarryX);
+    dy = mouseAxisDelta(st.ry, maxSpeed, &mouseCarryY);
     if (st.btnRS) buttons |= 0x02;  // IKBD left button = bit 1 ($FA header)
   } else {
     mouseCarryX = 0.0f;
