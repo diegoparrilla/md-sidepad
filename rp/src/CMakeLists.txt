@@ -149,6 +149,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         network.c
         reset.c
         romemul.c
+        rumble.c
         sdcard.c
         select.c
         term.c

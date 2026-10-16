@@ -8,9 +8,10 @@
 
 #include "display.h"
 
-static uint32_t displayAddress = 0;
-static uint32_t displayCommandAddress = 0;
-static uint32_t displaysHighresTranstableAddress = 0;
+// Addresses in the cartridge window, kept as uintptr_t rather than uint32_t:
+// the same on the RP2040, and whole on a 64-bit host under EmuMD.
+static uintptr_t displayAddress = 0;
+static uintptr_t displayCommandAddress = 0;
 
 // Static assert to ensure buffer size fits within uint32_t
 _Static_assert(DISPLAY_BUFFER_SIZE <= UINT32_MAX,
@@ -44,7 +45,7 @@ static unsigned char u8x8CadDummy(void *u8x8, unsigned char msg,
 }
 
 #ifdef DISPLAY_ATARIST
-static const u8x8_display_info_t u8x8Ataristlow320x200DisplayInfo = {
+static const u8x8_display_info_t u8x8Atarist640x200DisplayInfo = {
     /* chip_enable_level = */ 0,
     /* chip_disable_level = */ 1,
 
@@ -61,44 +62,34 @@ static const u8x8_display_info_t u8x8Ataristlow320x200DisplayInfo = {
     /* i2c_bus_clock_100kHz = */ 4,
     /* data_setup_time_ns = */ 120,   /* G242CX Datasheet p5 */
     /* write_pulse_width_ns = */ 220, /* G242CX Datasheet p5 */
-    /* tile_width = */ 40,
-    /* tile_height = */ 25,
+    /* tile_width = */ DISPLAY_TILES_WIDTH,
+    /* tile_height = */ DISPLAY_TILES_HEIGHT,
     /* default_x_offset = */ 0,
     /* flipmode_x_offset = */ 0,
-    /* pixel_width = */ 320,
-    /* pixel_height = */ 200};
+    /* pixel_width = */ DISPLAY_WIDTH,
+    /* pixel_height = */ DISPLAY_HEIGHT};
 
 // Getter function for u8g2 structure
 u8g2_t *display_getU8g2Ref() { return &u8g2; }
 
 // Getter function for display address
-uint32_t display_getAddress() { return displayAddress; }
+uintptr_t display_getAddress() { return displayAddress; }
 
 // Setter function for display address
-static void setDisplayAddress(uint32_t address) { displayAddress = address; }
+static void setDisplayAddress(uintptr_t address) { displayAddress = address; }
 
 // Getter function for display command address
-uint32_t display_getCommandAddress() { return displayCommandAddress; }
+uintptr_t display_getCommandAddress() { return displayCommandAddress; }
 
 // Setter function for display command address
-static void setDisplayCommandAddress(uint32_t address) {
+static void setDisplayCommandAddress(uintptr_t address) {
   displayCommandAddress = address;
-}
-
-// Getter function for highres translation table address
-uint32_t display_getHighresTranstableAddress() {
-  return displaysHighresTranstableAddress;
-}
-
-// Setter function for highres translation table address
-static void setDisplaysHighresTranstableAddress(uint32_t address) {
-  displaysHighresTranstableAddress = address;
 }
 
 unsigned char u8x8DCustom(u8x8_t *u8x8, unsigned char msg, unsigned char argInt,
                           void *argPtr) {
   if (msg == U8X8_MSG_DISPLAY_SETUP_MEMORY) {
-    u8x8_d_helper_display_setup_memory(u8x8, &u8x8Ataristlow320x200DisplayInfo);
+    u8x8_d_helper_display_setup_memory(u8x8, &u8x8Atarist640x200DisplayInfo);
   }
   return 1;
 }
@@ -111,28 +102,22 @@ void display_setupU8g2() {
 
 #if DISPLAY_BYPASS_FRAMEBUFFER == 1
   u8g2Buffer =
-      (void *)((unsigned int)&__rom_in_ram_start__ + DISPLAY_BUFFER_OFFSET);
+      (void *)((uintptr_t)&__rom_in_ram_start__ + DISPLAY_BUFFER_OFFSET);
 #else
   DPRINTF("Initializing u8g2 with a buffer size of %d bytes\n",
           DISPLAY_BUFFER_SIZE);
 #endif
 
-  setDisplayAddress((unsigned int)&__rom_in_ram_start__ +
+  setDisplayAddress((uintptr_t)&__rom_in_ram_start__ +
                     DISPLAY_BUFFER_OFFSET);
-  setDisplayCommandAddress((unsigned int)&__rom_in_ram_start__ +
+  setDisplayCommandAddress((uintptr_t)&__rom_in_ram_start__ +
                            DISPLAY_COMMAND_ADDRESS);
-  setDisplaysHighresTranstableAddress((unsigned int)&__rom_in_ram_start__ +
-                                      DISPLAY_HIGHRES_TRANSTABLE_ADDR);
-  DPRINTF("Display buffer address: 0x%08x\n", (unsigned int)u8g2Buffer);
-  DPRINTF("Display command address: 0x%08x\n", display_getCommandAddress());
-  DPRINTF("Highres translation table address: 0x%08x\n",
-          display_getHighresTranstableAddress());
+  DPRINTF("Display buffer address: 0x%08x\n",
+          (unsigned int)(uintptr_t)u8g2Buffer);
+  DPRINTF("Display command address: 0x%08x\n",
+          (unsigned int)display_getCommandAddress());
 
 #ifdef DISPLAY_ATARIST
-  // We need to generate the mask table for the Atari ST display (faster highres
-  // mode)
-  display_generateMaskTable(display_getHighresTranstableAddress());
-
   // We clear the command address just in case
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_NOP);
 #endif
@@ -168,26 +153,6 @@ void display_drawProductInfo() {
       &u8g2,
       LEFT_PADDING_FOR_CENTER(productStr, 68) * DISPLAY_NARROW_CHAR_WIDTH,
       DISPLAY_HEIGHT, productStr);
-}
-
-void display_generateMaskTable(uint32_t memoryAddress) {
-  for (int i = 0; i < DISPLAY_MASK_TABLE_SIZE; i++) {
-    unsigned int mask = 0;
-
-    // Duplicate each bit of the 8-bit number into two bits
-    for (int bit = 0; bit < DISPLAY_MASK_TABLE_CHAR; bit++) {
-      if (i & (1 << bit)) {
-        mask |= (3 << (2 * bit));  // Duplicate the bit at position b
-      }
-    }
-
-    // Store the 16 bit result mask in the memory address
-#if DISPLAY_HIGHRES_INVERT == 1
-    WRITE_WORD(memoryAddress, i * 2, ~mask);
-#else
-    WRITE_WORD(memoryAddress, i * 2, mask);
-#endif
-  }
 }
 
 // Scroll up the display buffer by blanking out the bottom part

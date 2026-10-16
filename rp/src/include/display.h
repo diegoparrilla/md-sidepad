@@ -24,17 +24,16 @@
 
 // For Atari ST display
 #ifdef DISPLAY_ATARIST
-#define DISPLAY_WIDTH 320
+// 640x200: medium resolution on a colour monitor, and line-doubled to
+// 640x400 on a mono one, so high res needs no pixel doubling.
+#define DISPLAY_WIDTH 640
 #define DISPLAY_HEIGHT 200
-#define DISPLAY_TILES_WIDTH 40
+#define DISPLAY_TILES_WIDTH 80
 #define DISPLAY_TILES_HEIGHT 25
 #define DISPLAY_TILE_HEIGHT 8
 #define DISPLAY_TILE_WIDHT 8
 #define DISPLAY_MAX_CHARACTERS 80
 #define DISPLAY_NARROW_CHAR_WIDTH 6
-
-#define DISPLAY_MASK_TABLE_SIZE 256
-#define DISPLAY_MASK_TABLE_CHAR 8
 
 // If 1, the display will not use the framebuffer and will write directly to the
 // display memory. This is useful to reduce the memory usage.
@@ -42,12 +41,6 @@
 // computer.
 #define DISPLAY_BYPASS_FRAMEBUFFER 1
 
-// #define DISPLAY_COMMAND_ADDRESS (ROM_IN_RAM_ADDRESS + 0x10000 + 8000) //
-// increment 64K bytes to get the second 64K block + 8000 bytes to get the 8K
-// block #define DISPLAY_HIGHRES_TRANSTABLE_ADDRESS (ROM_IN_RAM_ADDRESS +
-// 0x1000) // increment 4K bytes to create the translation table
-#define DISPLAY_HIGHRES_INVERT \
-  0  // If 1, the highres display will be inverted, otherwise it will be normal
 #define DISPLAY_BYPASS_MESSAGE "Press any SHIFT key to boot from GEMDOS."
 #define DISPLAY_TARGET_COMPUTER_NAME "Atari ST"
 #endif
@@ -62,13 +55,14 @@
 
 // Display offsets are derived from the shared-region layout owned by
 // chandler.h. The framebuffer sits at the top of the 64 KB region; the
-// command sentinel and the high-res translation table both live in the
-// shared block at the bottom of the region.
+// command sentinel lives in the shared block at the bottom of the region.
 #include "chandler.h"
 
 #define DISPLAY_BUFFER_OFFSET           CHANDLER_FRAMEBUFFER_OFFSET
 #define DISPLAY_COMMAND_ADDRESS         CHANDLER_CMD_SENTINEL_OFFSET
-#define DISPLAY_HIGHRES_TRANSTABLE_ADDR CHANDLER_APP_BUFFERS_OFFSET
+
+_Static_assert(DISPLAY_BUFFER_SIZE == CHANDLER_FRAMEBUFFER_SIZE,
+               "the framebuffer reserved in chandler.h must fit the display");
 
 // Commands sent to the active loop in the display terminal application
 #define DISPLAY_COMMAND_NOP 0x0       // Do nothing, clean the command buffer
@@ -131,18 +125,6 @@ void display_refresh();
 void display_drawProductInfo();
 
 /**
- * @brief Generates a high-resolution mask table. Used to speed up high-res
- * upscaled display.
- *
- * Creates a mask table by duplicating each bit of an 8-bit number into two
- * bits, producing a 16-bit value. Depending on the inversion setting, the
- * generated mask may be bitwise inverted before storage with WRITE_WORD.
- *
- * @param memoryAddress The memory address where the mask table will be stored.
- */
-void display_generateMaskTable(uint32_t memoryAddress);
-
-/**
  * @brief Returns a reference to the u8g2 display structure.
  *
  * Provides a pointer to the global u8g2 structure that holds configuration and
@@ -169,7 +151,7 @@ void display_scrollup(uint16_t blankBytes);
  *
  * @return The display buffer memory address.
  */
-uint32_t display_getAddress();
+uintptr_t display_getAddress();
 
 /**
  * @brief Retrieves the display command address.
@@ -179,17 +161,6 @@ uint32_t display_getAddress();
  *
  * @return The display command address.
  */
-uint32_t display_getCommandAddress();
-
-/**
- * @brief Retrieves the high-resolution translation table address. Used to
- * speedup the upscale of the high resolution display.
- *
- * Returns the memory address of the translation table required for
- * high-resolution display operations.
- *
- * @return The high-resolution translation table memory address.
- */
-uint32_t display_getHighresTranstableAddress();
+uintptr_t display_getCommandAddress();
 
 #endif  // DISPLAY_H

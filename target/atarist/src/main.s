@@ -38,18 +38,17 @@ ROM4_ADDR			equ $FA0000
 ;   $FA2008  RANDOM_TOKEN_SEED_ADDR	4 B
 ;   $FA200C  reserved			4 B
 ;   $FA2010  SHARED_VARIABLES		240 B (60 x 4-byte slots)
-;   $FA2100  APP_BUFFERS_ADDR	       ~48 KB free arena (TRANSTABLE etc.)
-;   $FAE0C0  FRAMEBUFFER_ADDR		8000 B (320x200 mono, at the top)
+;   $FA2100  APP_BUFFERS_ADDR	       ~40 KB free arena (first 512 B reserved)
+;   $FAC180  FRAMEBUFFER_ADDR		16000 B (640x200 mono, at the top)
 ;   $FAFFFF  end of region
 
 CARTRIDGE_CODE_SIZE	equ $2000	; 8 KB max for cartridge header + code
 SHARED_BLOCK_ADDR	equ (ROM4_ADDR + CARTRIDGE_CODE_SIZE)		; $FA2000
 CMD_MAGIC_SENTINEL_ADDR	equ SHARED_BLOCK_ADDR				; $FA2000
 
-FRAMEBUFFER_SIZE	equ 8000	; 8000 bytes of a 320x200 monochrome screen
-FRAMEBUFFER_ADDR	equ (ROM4_ADDR + $10000 - FRAMEBUFFER_SIZE)	; $FAE040
+FRAMEBUFFER_SIZE	equ 16000	; 16000 bytes of a 640x200 monochrome screen
+FRAMEBUFFER_ADDR	equ (ROM4_ADDR + $10000 - FRAMEBUFFER_SIZE)	; $FAC180
 APP_BUFFERS_ADDR	equ (SHARED_BLOCK_ADDR + $100)			; $FA2100
-TRANSTABLE		equ APP_BUFFERS_ADDR				; high-res translation table
 
 ; User firmware entry point. The cartridge image places userfw.s at
 ; offset $0800 of BOOT.BIN via target/atarist/src/userfw.ld; main.s
@@ -58,9 +57,9 @@ TRANSTABLE		equ APP_BUFFERS_ADDR				; high-res translation table
 USERFW			equ (ROM4_ADDR + $800)				; $FA0800
 
 SCREEN_SIZE			equ (-4096)	; Use the memory before the screen memory to store the copied code
-COLS_HIGH			equ 20		; 16 bit columns in the ST
-ROWS_HIGH			equ 200		; 200 rows in the ST
-BYTES_ROW_HIGH		equ 80		; 80 bytes per row in the ST
+COLS_HIGH			equ 40		; 16-pixel words in a 640-pixel row
+ROWS_HIGH			equ 200		; framebuffer rows, each shown twice in high res
+BYTES_ROW_HIGH		equ 80		; bytes in a high res screen row
 PRE_RESET_WAIT		equ $FFFFF
 
 ; If 1, the display will not use the framebuffer and will write directly to the
@@ -255,19 +254,48 @@ start_rom_code:
 	cmp.l #CMD_BOOT_GEM, d6
 	beq boot_gem
 
-; Get the resolution of the screen
+; Get the resolution of the screen. The terminal is 640x200: a mono
+; monitor shows it in high resolution with every line doubled, and a colour
+; one in medium resolution, which the terminal switches to here.
 	get_rez
 	cmp.w #2, d0				; Check if the resolution is 640x400 (high resolution)
 	beq .print_loop_high		; If it is, print the message in high resolution
 
-.print_loop_low:
+; Colour. Remember the resolution TOS chose, and medium's foreground colour
+; (3), so boot_gem can put both back before GEM starts. Colour 3 takes
+; colour 15's value, low resolution's foreground, so the text is the colour
+; it always was. XBIOS leaves a6 alone.
+	lea saved_rez(pc), a0
+	move.w d0, (a0)
+	move.w #1, -(sp)			; medium resolution
+	move.l #-1, -(sp)			; physical screen unchanged
+	move.l #-1, -(sp)			; logical screen unchanged
+	move.w #5, -(sp)			; XBIOS Setscreen
+	trap #14
+	lea 12(sp), sp
+	move.w #-1, -(sp)			; read colour 15, change nothing
+	move.w #15, -(sp)
+	move.w #7, -(sp)			; XBIOS Setcolor
+	trap #14
+	addq.l #6, sp
+	move.w d0, -(sp)			; colour 3 = colour 15
+	move.w #3, -(sp)
+	move.w #7, -(sp)
+	trap #14
+	addq.l #6, sp
+	lea saved_color3(pc), a0	; d0 = colour 3 as it was
+	move.w d0, (a0)
+
+.print_loop_med:
 	vsync_wait
 
-; We must move from the cartridge ROM to the screen memory to display the messages
+; We must move from the cartridge ROM to the screen memory to display the messages.
+; Medium resolution interleaves two planes a word at a time, so each
+; framebuffer word goes to both: colour 3 where it is set, 0 where it is not.
 	move.l a6, a0				; Set the screen memory address in a0
 	move.l #FRAMEBUFFER_ADDR, a1			; Set the cartridge ROM address in a1
 	move.l #((FRAMEBUFFER_SIZE / 2) -1), d0			; Set the number of words to copy
-.copy_screen_low:
+.copy_screen_med:
 	move.w (a1)+ , d1			; Copy a word from the cartridge ROM
 	ifne DISPLAY_BYPASS_FRAMEBUFFER == 1
 	rol.w #8, d1				; swap high and low bytes
@@ -275,24 +303,24 @@ start_rom_code:
 	move.w d1, d2				; Copy the word to d2
 	swap d2						; Swap the bytes
 	move.w d1, d2				; Copy the word to d2
-	move.l d2, (a0)+			; Copy the word to the screen memory
-	move.l d2, (a0)+			; Copy the word to the screen memory
-	dbf d0, .copy_screen_low    ; Loop until all the message is copied
+	move.l d2, (a0)+			; Both planes of one 16-pixel group
+	dbf d0, .copy_screen_med    ; Loop until all the message is copied
 
 ; Check the different commands and the keyboard
 	check_commands
 
-	bra .print_loop_low		; Continue printing the message
+	bra .print_loop_med		; Continue printing the message
 
 .print_loop_high:
 	vsync_wait
 
-; We must move from the cartridge ROM to the screen memory to display the messages
+; We must move from the cartridge ROM to the screen memory to display the messages.
+; High resolution is 640 wide already, so each framebuffer row is written
+; twice, to an even screen line (a1) and the odd one below it (a2).
 	move.l a6, a1				; Set the screen memory address in a1
 	move.l a6, a2
 	lea BYTES_ROW_HIGH(a2), a2	; Move to the next line in the screen
 	move.l #FRAMEBUFFER_ADDR, a0		; Set the cartridge ROM address in a0
-	move.l #TRANSTABLE, a3		; Set the translation table in a3
 	move.l #(ROWS_HIGH -1), d0	; Set the number of rows to copy - 1
 .copy_screen_row_high:
 	move.l #(COLS_HIGH -1), d1	; Set the number of columns to copy - 1 
@@ -303,18 +331,8 @@ start_rom_code:
 	rol.w #8, d2				; swap high and low bytes
 	endif
 
-	move.w d2, d3				; Copy the word to d3
-	and.w #$FF00, d3			; Mask the high byte
-	lsr.w #7, d3				; Shift the high byte 7 bits to the right
-	move.w (a3, d3.w), d4		; Translate the high byte
-	swap d4						; Swap the words
-
-	and.w #$00FF, d2			; Mask the low byte
-	add.w d2, d2				; Double the low byte
-	move.w (a3, d2.w), d4		; Translate the low byte
-
-	move.l d4, (a1)+			; Copy the word to the screen memory
-	move.l d4, (a2)+			; Copy the word to the screen memory
+	move.w d2, (a1)+			; Copy the word to the even line
+	move.w d2, (a2)+			; and to the odd line below it
 
 	dbf d1, .copy_screen_col_high   ; Loop until all the message is copied
 
@@ -357,6 +375,26 @@ boot_gem:
 	; boot where CMD_START already installed. bsr/rts is stack-balanced, so the
 	; final rts below still unwinds the print loop back to TOS.
 	bsr	rom_function
+	; Put back the resolution and colour 3 the terminal changed for medium
+	; resolution, so the desktop comes up as TOS meant it to and the banner
+	; below prints in it. saved_rez is -1 when nothing was changed: a mono
+	; monitor, or a warm reset that came straight here.
+	lea	saved_rez(pc), a0
+	move.w	(a0), d0
+	bmi.s	.bg_rez_kept
+	move.w	d0, -(sp)
+	move.l	#-1, -(sp)
+	move.l	#-1, -(sp)
+	move.w	#5, -(sp)				; XBIOS Setscreen
+	trap	#14
+	lea	12(sp), sp
+	lea	saved_color3(pc), a0
+	move.w	(a0), -(sp)
+	move.w	#3, -(sp)
+	move.w	#7, -(sp)				; XBIOS Setcolor
+	trap	#14
+	addq.l	#6, sp
+.bg_rez_kept:
 	; Print the exit banner via the VT52 console, then return to TOS to continue
 	; booting to the GEM desktop. boot_gem is reached via a beq from
 	; check_commands inside the print loop, at the same stack level as the
@@ -470,6 +508,13 @@ rom_function:
 
 userfw_installed:
     dc.l    0
+
+; What the terminal changed for medium resolution, for boot_gem to put back.
+; In the relocated RAM copy, so writable, and fresh on every boot.
+saved_rez:
+    dc.w    -1                  ; -1: resolution not changed
+saved_color3:
+    dc.w    0
 
 ; Shared functions included at the end of the file
 ; Don't forget to include the macros for the shared functions at the top of file

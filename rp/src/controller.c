@@ -28,6 +28,7 @@
 #include "debug.h"
 #include "hardware/sync.h"
 #include "include/network.h"
+#include "include/rumble.h"
 #include "pico/time.h"
 #include "uni.h"
 
@@ -41,21 +42,32 @@
 // Atari-style 8-way directions.
 #define CONTROLLER_DEADZONE 0.30f
 
+// One controller slot. The slot number is the Bluepad32 device index, so a
+// pad keeps its slot (and its Xpad pad number) for as long as it stays
+// connected, and a new pad takes the first free one.
 typedef struct {
-  bool initialized;
-  bool connected;       // a controller is connected and ready
-  bool connecting;      // a device connected but is not ready yet
-  bool pairingRequested;
-  int connectedIdx;     // Bluepad32 device index of the live controller, or -1
+  bool connected;   // a controller is connected and ready
+  bool connecting;  // a device connected but is not ready yet
   char deviceName[32];
-  char status[64];
   // Input fields of the latest decoded report. Only the gamepad-derived members
   // of controller_state_t are populated here; meta fields are filled in
-  // controller_getState().
+  // controller_getPadState().
   controller_state_t input;
+} controller_pad_t;
+
+typedef struct {
+  bool initialized;
+  bool pairingRequested;
+  char status[64];
+  controller_pad_t pads[CONTROLLER_MAX_PADS];
 } controller_runtime_t;
 
 static controller_runtime_t gRuntime = {0};
+
+// Bluepad32's device table is what hands out the slot numbers, so the two must
+// agree: a bigger table would give us indices with nowhere to go.
+_Static_assert(CONTROLLER_MAX_PADS == CONFIG_BLUEPAD32_MAX_DEVICES,
+               "one controller slot per Bluepad32 device");
 
 // Clear the input snapshot to its REST state, which is not all-zero: the
 // stick axes are normalised with 0.5 at centre, so memsetting them to 0
@@ -67,12 +79,27 @@ static controller_runtime_t gRuntime = {0};
 // values and it inexplicably starts working.
 //
 // Triggers stay at zero, which really is their rest value.
-static void resetInputToRest(void) {
-  memset(&gRuntime.input, 0, sizeof(gRuntime.input));
-  gRuntime.input.lx = 0.5f;
-  gRuntime.input.ly = 0.5f;
-  gRuntime.input.rx = 0.5f;
-  gRuntime.input.ry = 0.5f;
+static void resetInputToRest(controller_pad_t *pad) {
+  memset(&pad->input, 0, sizeof(pad->input));
+  pad->input.lx = 0.5f;
+  pad->input.ly = 0.5f;
+  pad->input.rx = 0.5f;
+  pad->input.ry = 0.5f;
+}
+
+// Empty a slot: not connected, no name, sticks at rest.
+static void clearPad(controller_pad_t *pad) {
+  pad->connected = false;
+  pad->connecting = false;
+  pad->deviceName[0] = '\0';
+  resetInputToRest(pad);
+}
+
+// The slot a Bluepad32 device occupies, or -1 if its index is out of range,
+// which the assertion above says cannot happen.
+static int slotFor(const uni_hid_device_t *d) {
+  int idx = (d != NULL) ? uni_hid_device_get_idx_for_instance(d) : -1;
+  return ((idx >= 0) && (idx < CONTROLLER_MAX_PADS)) ? idx : -1;
 }
 
 static float normalize_axis(int32_t value) {
@@ -211,38 +238,49 @@ static void captureControllerName(char *dst, size_t dstSize, const char *src) {
 }
 
 static void sidepad_platform_on_device_connected(uni_hid_device_t *d) {
-  int idx = uni_hid_device_get_idx_for_instance(d);
+  int idx = slotFor(d);
+  if (idx < 0) {
+    return;
+  }
   uint32_t irqState = save_and_disable_interrupts();
-  gRuntime.connecting = true;
-  gRuntime.connected = false;
-  gRuntime.connectedIdx = idx;
+  gRuntime.pads[idx].connecting = true;
+  gRuntime.pads[idx].connected = false;
   restore_interrupts(irqState);
-  DPRINTF("bluepad32: device connected %p (idx %d)\n", (void *)d, idx);
+  DPRINTF("bluepad32: device connected %p (slot %d)\n", (void *)d, idx);
 }
 
 static void sidepad_platform_on_device_disconnected(uni_hid_device_t *d) {
-  ARG_UNUSED(d);
+  int idx = slotFor(d);
+  if (idx < 0) {
+    return;
+  }
   uint32_t irqState = save_and_disable_interrupts();
-  gRuntime.connected = false;
-  gRuntime.connecting = false;
-  gRuntime.connectedIdx = -1;
-  resetInputToRest();
-  gRuntime.deviceName[0] = '\0';
+  clearPad(&gRuntime.pads[idx]);
   restore_interrupts(irqState);
-  DPRINTF("bluepad32: device disconnected %p\n", (void *)d);
+  // Whatever it was asked to rumble at goes with it: a pad that later takes
+  // this slot starts quiet, until the ST asks again.
+  rumble_padGone(idx);
+  DPRINTF("bluepad32: device disconnected %p (slot %d)\n", (void *)d, idx);
 }
 
 static uni_error_t sidepad_platform_on_device_ready(uni_hid_device_t *d) {
-  uint32_t irqState = save_and_disable_interrupts();
-  gRuntime.connected = true;
-  gRuntime.connecting = false;
-  if (d != NULL) {
-    captureControllerName(gRuntime.deviceName, sizeof(gRuntime.deviceName),
-                          d->name);
+  int idx = slotFor(d);
+  if (idx < 0) {
+    return UNI_ERROR_NO_SLOTS;
   }
+  uint32_t irqState = save_and_disable_interrupts();
+  gRuntime.pads[idx].connected = true;
+  gRuntime.pads[idx].connecting = false;
+  captureControllerName(gRuntime.pads[idx].deviceName,
+                        sizeof(gRuntime.pads[idx].deviceName), d->name);
   restore_interrupts(irqState);
-  DPRINTF("bluepad32: device ready %p (%s)\n", (void *)d,
-          (d != NULL) ? d->name : "");
+  // Light the player number, on pads that have player LEDs, so it is plain
+  // which pad is player 1 and therefore the joystick.
+  if (d->report_parser.set_player_leds != NULL) {
+    d->report_parser.set_player_leds(d, (uint8_t)(1u << idx));
+  }
+  DPRINTF("bluepad32: device ready %p (slot %d, %s)\n", (void *)d, idx,
+          d->name);
   return UNI_ERROR_SUCCESS;
 }
 
@@ -251,18 +289,22 @@ static void sidepad_platform_on_controller_data(uni_hid_device_t *d,
   if ((ctl == NULL) || (ctl->klass != UNI_CONTROLLER_CLASS_GAMEPAD)) {
     return;
   }
+  int idx = slotFor(d);
+  if (idx < 0) {
+    return;
+  }
 
   controller_state_t mapped = {0};
   map_gamepad(&ctl->gamepad, &mapped);
 
+  controller_pad_t *pad = &gRuntime.pads[idx];
   uint32_t irqState = save_and_disable_interrupts();
-  gRuntime.input = mapped;
+  pad->input = mapped;
   // The remote BT name can resolve after on_device_ready, so capture it here
   // (once) as soon as a valid printable name is available — input only flows
   // from a ready device. captureControllerName rejects garbage buffers.
-  if ((gRuntime.deviceName[0] == '\0') && (d != NULL)) {
-    captureControllerName(gRuntime.deviceName, sizeof(gRuntime.deviceName),
-                          d->name);
+  if (pad->deviceName[0] == '\0') {
+    captureControllerName(pad->deviceName, sizeof(pad->deviceName), d->name);
   }
   restore_interrupts(irqState);
 }
@@ -313,7 +355,9 @@ int controller_init(void) {
 
   // Before anything can read the state: gRuntime is a zero-initialised
   // static, and zero is not rest for the stick axes.
-  resetInputToRest();
+  for (int i = 0; i < CONTROLLER_MAX_PADS; i++) {
+    clearPad(&gRuntime.pads[i]);
+  }
 
   // Bring up the CYW43 chip. With CYW43_ENABLE_BLUETOOTH=1 this also powers the
   // Bluetooth controller, which Bluepad32 then drives via BTstack.
@@ -329,11 +373,7 @@ int controller_init(void) {
   uni_init(0, NULL);
 
   gRuntime.initialized = true;
-  gRuntime.connected = false;
-  gRuntime.connecting = false;
   gRuntime.pairingRequested = false;
-  gRuntime.connectedIdx = -1;
-  gRuntime.deviceName[0] = '\0';
   snprintf(gRuntime.status, sizeof(gRuntime.status), "Scanning for controller...");
 
   return 0;
@@ -348,21 +388,26 @@ void controller_poll(void) {
   // callbacks above.
   network_safePoll();
 
-  bool connected;
-  bool connecting;
+  int connected = 0;
+  bool connecting = false;
   bool pairing;
   uint32_t irqState = save_and_disable_interrupts();
-  connected = gRuntime.connected;
-  connecting = gRuntime.connecting;
+  for (int i = 0; i < CONTROLLER_MAX_PADS; i++) {
+    if (gRuntime.pads[i].connected) connected++;
+    if (gRuntime.pads[i].connecting) connecting = true;
+  }
   pairing = gRuntime.pairingRequested;
-  if (pairing && connected) {
+  if (pairing && (connected > 0)) {
     gRuntime.pairingRequested = false;
     pairing = false;
   }
   restore_interrupts(irqState);
 
-  if (connected) {
+  if (connected == 1) {
     snprintf(gRuntime.status, sizeof(gRuntime.status), "Controller connected");
+  } else if (connected > 1) {
+    snprintf(gRuntime.status, sizeof(gRuntime.status),
+             "%d controllers connected", connected);
   } else if (connecting) {
     snprintf(gRuntime.status, sizeof(gRuntime.status),
              "Connecting to controller...");
@@ -381,30 +426,30 @@ void controller_requestPairing(void) {
   }
 
   // Called from the app loop (not the BT thread), so use the "safe" variants.
-  // Drop the live controller first: uni_bt_del_keys_safe() only clears stored
-  // bonding keys, it does NOT tear down an active link. Without the explicit
-  // disconnect the previously-paired controller stays connected (and re-bonds),
-  // so a new controller never gets to pair. Disconnecting frees the slot and,
-  // with its key now gone, the old controller won't auto-reconnect - only a
-  // controller actively in pairing mode will be picked up by the scan.
-  uint32_t irqState = save_and_disable_interrupts();
-  int idx = gRuntime.connectedIdx;
-  restore_interrupts(irqState);
-  if (idx >= 0) {
-    uni_bt_disconnect_device_safe(idx);
+  // Drop every live controller first: uni_bt_del_keys_safe() only clears
+  // stored bonding keys, it does NOT tear down an active link. Without the
+  // explicit disconnect a previously-paired controller stays connected (and
+  // re-bonds). Disconnecting frees its slot and, with its key now gone, it
+  // won't auto-reconnect - only a controller actively in pairing mode will be
+  // picked up by the scan.
+  for (int i = 0; i < CONTROLLER_MAX_PADS; i++) {
+    uint32_t irqState = save_and_disable_interrupts();
+    bool live = gRuntime.pads[i].connected || gRuntime.pads[i].connecting;
+    restore_interrupts(irqState);
+    if (live) {
+      uni_bt_disconnect_device_safe(i);
+    }
   }
 
   // Forget stored keys and (re)start scanning so a fresh controller can pair.
   uni_bt_del_keys_safe();
   uni_bt_start_scanning_and_autoconnect_safe();
 
-  irqState = save_and_disable_interrupts();
+  uint32_t irqState = save_and_disable_interrupts();
   gRuntime.pairingRequested = true;
-  gRuntime.connected = false;
-  gRuntime.connecting = false;
-  gRuntime.connectedIdx = -1;
-  resetInputToRest();
-  gRuntime.deviceName[0] = '\0';
+  for (int i = 0; i < CONTROLLER_MAX_PADS; i++) {
+    clearPad(&gRuntime.pads[i]);
+  }
   restore_interrupts(irqState);
 
   snprintf(gRuntime.status, sizeof(gRuntime.status),
@@ -412,18 +457,23 @@ void controller_requestPairing(void) {
 }
 
 void controller_getState(controller_state_t *outState) {
-  if (outState == NULL) {
+  controller_getPadState(0, outState);
+}
+
+void controller_getPadState(int idx, controller_state_t *outState) {
+  if ((outState == NULL) || (idx < 0) || (idx >= CONTROLLER_MAX_PADS)) {
     return;
   }
 
+  const controller_pad_t *pad = &gRuntime.pads[idx];
   controller_state_t inputSnapshot;
   bool connected;
-  char deviceName[sizeof(gRuntime.deviceName)];
+  char deviceName[sizeof(pad->deviceName)];
 
   uint32_t irqState = save_and_disable_interrupts();
-  inputSnapshot = gRuntime.input;
-  connected = gRuntime.connected;
-  memcpy(deviceName, gRuntime.deviceName, sizeof(deviceName));
+  inputSnapshot = pad->input;
+  connected = pad->connected;
+  memcpy(deviceName, pad->deviceName, sizeof(deviceName));
   restore_interrupts(irqState);
 
   // Start from the decoded input fields, then overlay meta fields.
@@ -438,6 +488,23 @@ void controller_getState(controller_state_t *outState) {
   outState->pairedAddressType[0] = '\0';
   snprintf(outState->deviceName, sizeof(outState->deviceName), "%s", deviceName);
   snprintf(outState->status, sizeof(outState->status), "%s", gRuntime.status);
+}
+
+bool controller_playRumble(int idx, uint8_t weak, uint8_t strong,
+                           uint16_t durationMs) {
+  if (!gRuntime.initialized || (idx < 0) || (idx >= CONTROLLER_MAX_PADS) ||
+      !gRuntime.pads[idx].connected) {
+    return false;
+  }
+  // Safe from the app loop: with the lwIP poll architecture BTstack runs
+  // inside cyw43_arch_poll() on this same thread, so nothing else is in
+  // Bluepad32 while this sends the report.
+  uni_hid_device_t *d = uni_hid_device_get_instance_for_idx(idx);
+  if ((d == NULL) || (d->report_parser.play_dual_rumble == NULL)) {
+    return false;
+  }
+  d->report_parser.play_dual_rumble(d, 0, durationMs, weak, strong);
+  return true;
 }
 
 bool controller_getAndClearRestartRequested(void) { return false; }

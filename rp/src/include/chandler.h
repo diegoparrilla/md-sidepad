@@ -33,20 +33,19 @@
 //   $FA2008  RANDOM_TOKEN_SEED     4 B
 //   $FA200C  reserved              4 B
 //   $FA2010  SHARED_VARIABLES    240 B  (60 indexed 4-byte slots)
-//   $FA2100  APP_BUFFERS              ~48 KB arena
+//   $FA2100  APP_BUFFERS              ~40 KB arena
 //                                      The first 512 bytes (until $FA2300)
-//                                      are written by display_setupU8g2()
-//                                      with the high-res mask table the
-//                                      cartridge uses to render the
-//                                      framebuffer in 640x400 mode. Apps
-//                                      that don't use the high-res path
-//                                      can reclaim those 512 bytes; apps
-//                                      that do must skip the first
-//                                      CHANDLER_HIGHRES_TRANSTABLE_SIZE
-//                                      bytes of APP_BUFFERS.
+//                                      are reserved. They held the mask
+//                                      table the cartridge used to double
+//                                      a 320-pixel framebuffer's pixels
+//                                      in high res; at 640x200 high res
+//                                      only doubles lines, so nothing
+//                                      writes them now. Kept reserved so
+//                                      APP_FREE (and the Xpad block at
+//                                      its start) does not move.
 //   $FA2300  APP_FREE                 free for app-specific use until the
-//                                      framebuffer (~48 KB)
-//   $FAE0C0  FRAMEBUFFER         8000 B  (320x200 mono; sits at the top
+//                                      framebuffer (~40 KB)
+//   $FAC180  FRAMEBUFFER        16000 B  (640x200 mono; sits at the top
 //                                         so an overrun walks off the end
 //                                         of the 64 KB region and into
 //                                         unused RP RAM)
@@ -64,15 +63,14 @@
 #define CHANDLER_APP_BUFFERS_OFFSET                                            \
   (CHANDLER_SHARED_VARIABLES_OFFSET + (CHANDLER_SHARED_VARIABLES_SLOTS * 4))
 
-/* High-res mask table written by display_generateMaskTable() at the start
- * of APP_BUFFERS. 256 entries x 16 bits = 512 bytes. Apps using the
- * high-res rendering path must not reuse this region. */
+/* Reserved 512 bytes at the start of APP_BUFFERS, where the high-res mask
+ * table used to be (see the layout above). Nothing writes them now. */
 #define CHANDLER_HIGHRES_TRANSTABLE_OFFSET CHANDLER_APP_BUFFERS_OFFSET
 #define CHANDLER_HIGHRES_TRANSTABLE_SIZE   0x200  /* 512 bytes */
 #define CHANDLER_APP_FREE_OFFSET                                               \
   (CHANDLER_HIGHRES_TRANSTABLE_OFFSET + CHANDLER_HIGHRES_TRANSTABLE_SIZE)
 
-#define CHANDLER_FRAMEBUFFER_SIZE  0x1F40  /* 8000 bytes (320x200 mono) */
+#define CHANDLER_FRAMEBUFFER_SIZE  0x3E80  /* 16000 bytes (640x200 mono) */
 #define CHANDLER_FRAMEBUFFER_OFFSET (0x10000 - CHANDLER_FRAMEBUFFER_SIZE)
 #define CHANDLER_REGION_END        0x10000  /* 64 KB shared region top */
 

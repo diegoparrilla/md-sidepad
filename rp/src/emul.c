@@ -35,6 +35,7 @@
 #include "pico/stdlib.h"
 #include "reset.h"
 #include "romemul.h"
+#include "rumble.h"
 #include "sdcard.h"
 #include "select.h"
 #include "target_firmware.h"  // Include the target firmware binary
@@ -79,19 +80,42 @@
 // this side, by not publishing it at all.
 #define SIDEPAD_XPAD_ENABLED_SLOT 8
 
+// ROM3 commands from the resident m68k hook (userfw.s), for Xpad rumble.
+// The ids sit well away from the terminal's 0 (ESC) and 1 (keystroke), and
+// must match target/atarist/src/inc/sidepad_cmds.s. Both carry the usual
+// 4-byte random token first, sent as zero, which chandler skips.
+//
+// APP_XPAD_REQ_ADDR: one long, the m68k address of the XPAD_REQ area the
+//   installer set aside in its RAM block. Sent while it installs, and again
+//   after every warm reset; it waits to see the address in the block.
+// APP_XPAD_RUMBLE: four words, one per pad, the low frequency motor in the
+//   high byte and the high frequency motor in the low byte. The whole state
+//   every time, never a change: chandler holds one pending command, so a
+//   frame can be lost, and the next one must be enough on its own.
+#define APP_XPAD_REQ_ADDR 0x5850
+#define APP_XPAD_RUMBLE 0x5851
+
 // Right-stick-as-mouse tuning (analog, proportional). Deadzone around centre
-// (0.5) below which the stick is idle, and the max per-frame cursor delta at
-// full deflection. Both are feel parameters to tune on hardware.
+// (0.5) below which the stick is idle, and the cursor's speed at full
+// deflection in pixels per injection: 50 injections a second on ETV, and the
+// display's rate on VBL. Both are feel parameters to tune on hardware. This
+// was 20 while ETV wrongly injected at 12.5 Hz; 5 at 50 Hz keeps that top
+// speed, 250 pixels a second.
 #define SIDEPAD_MOUSE_DEADZONE 0.15f
-#define SIDEPAD_MOUSE_MAX_SPEED 20
+#define SIDEPAD_MOUSE_MAX_SPEED 5.0f
 
 enum {
   APP_MODE_SETUP = 255  // Setup
 };
 
-// Number of terminal rows used by the controller UI (last row is the terminal
-// status line, owned by term.c).
-#define UI_ROW_COUNT (TERM_SCREEN_SIZE_Y - 1)
+// Number of terminal rows used by the controller UI: all of them. (The last
+// was once left for a status line the template's line-based prompt used;
+// term.c draws nothing there, and MD/Sidepad has no prompt.) The bottom row
+// is safe from scrolling because nothing here ever writes its last cell or
+// prints a newline: every row is placed with ESC Y, appendLineAt stops one
+// short of the last column, and the cursor is only parked in that empty cell.
+// Writing into it, or a newline on the bottom row, would scroll the screen.
+#define UI_ROW_COUNT TERM_SCREEN_SIZE_Y
 
 // Throttles redraws of the live controller UI to UI_REFRESH_MS.
 static absolute_time_t uiRefreshTime;
@@ -133,39 +157,70 @@ static void appendMoveAndClearLine(char *buffer, size_t bufferSize,
 
 static void appendLineAt(char *buffer, size_t bufferSize, size_t *offset,
                          uint8_t row, const char *text) {
+  // One cell short of the full width: the last column is never drawn, so
+  // the cursor can be parked there out of the way.
   char line[TERM_SCREEN_SIZE_X + 1] = {0};
-  if (text != NULL) {
-    snprintf(line, sizeof(line), "%-39.39s", text);
-  } else {
-    snprintf(line, sizeof(line), "%-39s", "");
-  }
+  snprintf(line, sizeof(line), "%-*.*s", TERM_SCREEN_SIZE_X - 1,
+           TERM_SCREEN_SIZE_X - 1, (text != NULL) ? text : "");
   appendMoveAndClearLine(buffer, bufferSize, offset, row);
   appendFmt(buffer, bufferSize, offset, "%s", line);
 }
+
+// Everything that would sit against the left edge starts this far in, where
+// the title's text does after its two rule cells. A mono monitor's border is
+// always black, so text at column 0 would be right up against it.
+#define LEFT_MARGIN 2
 
 // Layout of the digital joystick indicator drawn with text characters.
 // A direction box on the left holds a solid block that moves to one of nine
 // positions (centre + 8 compass directions); a fire box on the right fills
 // solid when any button is pressed.
-#define DIR_BOX_INNER_W 9  // inner playfield width in chars
-#define DIR_BOX_INNER_H 9  // inner playfield height in rows
-#define DIR_BLOCK_SIZE 3   // direction blob is DIR_BLOCK_SIZE x DIR_BLOCK_SIZE
-#define DIR_BOX_ROW 6      // first screen row of the direction box
-#define DIR_BOX_COL 0      // left screen column of the direction box
-#define FIRE_BOX_INNER_W 3
+//
+// The terminal is 80 columns of medium resolution, where a character cell is
+// twice as tall as it is wide, so everything here is twice as many cells wide
+// as it is tall to come out square: the direction box is 18x9 inside, its
+// blob 6x3, the fire box 6x3.
+#define DIR_BOX_INNER_W 18  // inner playfield width in chars
+#define DIR_BOX_INNER_H 9   // inner playfield height in rows
+#define DIR_BLOCK_W 6       // direction blob width in chars
+#define DIR_BLOCK_H 3       // direction blob height in rows
+#define DIR_BOX_ROW 5       // first screen row of the direction box
+#define DIR_BOX_COL LEFT_MARGIN  // left screen column of the direction box
+#define FIRE_BOX_INNER_W 6
 #define FIRE_BOX_INNER_H 3
-// Direction box spans cols 0..(DIR_BOX_COL + DIR_BOX_INNER_W + 1) = 0..10;
-// place the fire box at col 12 to leave exactly one empty column (11) between
-// them.
-#define FIRE_BOX_COL 12  // left screen column of the fire box
+// Direction box spans cols DIR_BOX_COL..(DIR_BOX_COL + DIR_BOX_INNER_W + 1) =
+// 2..21; the fire box starts two empty columns (22, 23) later, at 24, the
+// one-column gap of 40-column days at the new width.
+#define FIRE_BOX_COL (DIR_BOX_COL + DIR_BOX_INNER_W + 4)
 
 // Mouse mode draws a second pair: an exact clone of the joystick pair shifted
-// to the right half (direction box left, button box on its right). Direction
-// box cols 22..32, button box cols 34..38 (the rightmost rendered cell). Titles
-// sit one blank row below both boxes (box bottom is DIR_BOX_ROW + INNER_H + 1).
-#define MOUSE_DIR_BOX_COL 22
-#define MOUSE_FIRE_BOX_COL 34
+// to the right half (direction box left, button box on its right), starting
+// at SECOND_COLUMN so it lines up with the second column of controllers
+// above it: direction box cols 42..61, button box cols 64..71. Titles sit one
+// blank row below both boxes (box bottom is DIR_BOX_ROW + INNER_H + 1), at
+// each pair's left edge.
+#define MOUSE_DIR_BOX_COL SECOND_COLUMN
+#define MOUSE_FIRE_BOX_COL (MOUSE_DIR_BOX_COL + FIRE_BOX_COL - DIR_BOX_COL)
 #define VIS_TITLE_ROW (DIR_BOX_ROW + DIR_BOX_INNER_H + 3)
+
+// The controllers, numbered from 1 as players are, in two columns starting
+// two rows below the title: 1 and 2 down the left (rows 2-3), 3 and 4 down
+// the right, then a blank row before the boxes at DIR_BOX_ROW. The auto-exit
+// countdown sits two rows above the rule, clear of the visualiser titles.
+#define PAD_LIST_ROW 2
+#define PAD_LIST_ROWS (CONTROLLER_MAX_PADS / 2)
+#define COUNTDOWN_ROW (UI_ROW_COUNT - 4)
+
+// The second of two columns, for the controller list and the help page alike:
+// as far past halfway as the first column is past the left edge. Entries in
+// the first column must end at least two cells short of it.
+#define SECOND_COLUMN (TERM_SCREEN_SIZE_X / 2 + LEFT_MARGIN)
+
+// Where text set into a rule ends. appendLineAt renders TERM_SCREEN_SIZE_X - 1
+// cells, and two rule cells are left after the text (----vX.Y.Z--). The
+// version on the bottom rule and the controller count on the title rule both
+// end here, so they line up.
+#define RULE_TEXT_END ((size_t)(TERM_SCREEN_SIZE_X - 1) - 2)
 
 // Right-stick-as-mouse toggle ([M] in the controller UI). Persisted to per-app
 // config (ACONFIG_PARAM_MOUSE): loaded at startup and saved on exit to desktop,
@@ -189,7 +244,7 @@ static bool xpadMode = true;
 // startup. Published to shared-var slot 6 (inline in exitToGemDesktop) on the
 // way out to the desktop so the m68k userfw installer hooks the matching
 // vector. ETV survives programs that replace the VBL vector; the m68k
-// rate-limits it to ~50 Hz to match the VBL route.
+// injects on every etv_timer call, which TOS makes at 50 Hz.
 static bool etvMode = true;
 
 // Help-screen toggle (dedicated ST Help key, scan code SCAN_HELP). When true
@@ -227,11 +282,11 @@ static absolute_time_t autoExitDeadline;
 // Draws a bordered box into lines at the given top-left cell using the
 // line-drawing glyphs. The inner area is filled by fillChar; pass '\0' to leave
 // it blank. The block, when blockRow/blockCol are >= 0, overwrites a
-// blockSize x blockSize square of inner cells with the solid glyph.
+// blockW x blockH patch of inner cells with the solid glyph.
 static void drawBox(char lines[][TERM_SCREEN_SIZE_X + 1], uint8_t topRow,
                     uint8_t leftCol, uint8_t innerW, uint8_t innerH,
-                    char fillChar, int blockRow, int blockCol,
-                    uint8_t blockSize) {
+                    char fillChar, int blockRow, int blockCol, uint8_t blockW,
+                    uint8_t blockH) {
   uint8_t bottomRow = topRow + innerH + 1;
   uint8_t rightCol = leftCol + innerW + 1;
 
@@ -258,8 +313,8 @@ static void drawBox(char lines[][TERM_SCREEN_SIZE_X + 1], uint8_t topRow,
   }
 
   if ((blockRow >= 0) && (blockCol >= 0)) {
-    for (uint8_t by = 0; by < blockSize; by++) {
-      for (uint8_t bx = 0; bx < blockSize; bx++) {
+    for (uint8_t by = 0; by < blockH; by++) {
+      for (uint8_t bx = 0; bx < blockW; bx++) {
         lines[topRow + 1 + blockRow + by][leftCol + 1 + blockCol + bx] =
             BLOCK_CHAR;
       }
@@ -272,22 +327,23 @@ static void drawBox(char lines[][TERM_SCREEN_SIZE_X + 1], uint8_t topRow,
 static void drawJoyPair(char lines[][TERM_SCREEN_SIZE_X + 1], uint8_t dirCol,
                         uint8_t fireCol, bool up, bool down, bool left,
                         bool right, bool fire) {
-  int blockRow = (DIR_BOX_INNER_H - DIR_BLOCK_SIZE) / 2;
-  int blockCol = (DIR_BOX_INNER_W - DIR_BLOCK_SIZE) / 2;
+  int blockRow = (DIR_BOX_INNER_H - DIR_BLOCK_H) / 2;
+  int blockCol = (DIR_BOX_INNER_W - DIR_BLOCK_W) / 2;
   if (up) blockRow = 0;
-  if (down) blockRow = DIR_BOX_INNER_H - DIR_BLOCK_SIZE;
+  if (down) blockRow = DIR_BOX_INNER_H - DIR_BLOCK_H;
   if (left) blockCol = 0;
-  if (right) blockCol = DIR_BOX_INNER_W - DIR_BLOCK_SIZE;
+  if (right) blockCol = DIR_BOX_INNER_W - DIR_BLOCK_W;
 
   drawBox(lines, DIR_BOX_ROW, dirCol, DIR_BOX_INNER_W, DIR_BOX_INNER_H, '\0',
-          blockRow, blockCol, DIR_BLOCK_SIZE);
+          blockRow, blockCol, DIR_BLOCK_W, DIR_BLOCK_H);
   drawBox(lines, DIR_BOX_ROW, fireCol, FIRE_BOX_INNER_W, FIRE_BOX_INNER_H,
-          fire ? BLOCK_CHAR : '\0', -1, -1, 1);
+          fire ? BLOCK_CHAR : '\0', -1, -1, 1, 1);
 }
 
 // Escape-sequence scratch for one screen refresh, sized once so the helper
-// below and the buffer in renderControllerScreen cannot disagree.
-#define UPDATES_SIZE 2048
+// below and the buffer in renderControllerScreen cannot disagree. A full
+// refresh of 80 columns is over 2 KB.
+#define UPDATES_SIZE 4096
 
 // One visualiser title: "Joystick: on" with the toggle letter in reverse
 // video. Emitted as escape sequences rather than into the character grid,
@@ -307,14 +363,19 @@ static void emitToggleTitle(char *updates, size_t *offset, uint8_t dirCol,
             "\x1B"
             "q"
             "%s: %s",
-            (char)(TERM_POS_Y + VIS_TITLE_ROW), (char)(TERM_POS_X + dirCol + 1),
+            (char)(TERM_POS_Y + VIS_TITLE_ROW), (char)(TERM_POS_X + dirCol),
             key, rest, on ? "on " : "off");
 }
 
 static void renderControllerScreen(const controller_state_t *state,
                                    bool forceFullRefresh) {
+  // All three static: at 80 columns they come to about 6 KB, more than the
+  // core 0 stack can spare, and a refresh never runs inside another one.
+  // Every row of currentLines is rewritten below, and updates is
+  // restarted, so nothing carries over between calls.
   static char previousLines[UI_ROW_COUNT][TERM_SCREEN_SIZE_X + 1] = {{0}};
-  char currentLines[UI_ROW_COUNT][TERM_SCREEN_SIZE_X + 1] = {{0}};
+  static char currentLines[UI_ROW_COUNT][TERM_SCREEN_SIZE_X + 1];
+  static char updates[UPDATES_SIZE];
 
   if (state == NULL) {
     return;
@@ -327,30 +388,64 @@ static void renderControllerScreen(const controller_state_t *state,
   }
 
   // Title row: two leading rule cells, "MD/Sidepad", then a rule to the edge
-  // (--MD/Sidepad------).
+  // (--MD/Sidepad------). The rule cells are the left margin.
   const char *title = "MD/Sidepad";
   size_t titleLen = strlen(title);
-  const size_t titleLead = 2;
+  const size_t titleLead = LEFT_MARGIN;
   memset(currentLines[0], GLYPH_H, titleLead);
   memcpy(currentLines[0] + titleLead, title, titleLen);
   memset(currentLines[0] + titleLead + titleLen, GLYPH_H,
          TERM_SCREEN_SIZE_X - titleLead - titleLen);
 
-  // Prefer the connected controller's name; fall back to the status message.
-  const char *status;
-  if (state->connected && state->deviceName[0] != '\0') {
-    status = state->deviceName;
-  } else if (state->status[0] != '\0') {
-    status = state->status;
-  } else {
-    status = "N/A";
+  // The connected controllers, one place per slot: "1 Xbox Wireless
+  // Controller". Pad 1 is the joystick and mouse; every pad is in Xpad. An
+  // empty slot is left blank, so a pad's place never moves. With nothing
+  // connected at all, the first row carries the status message instead
+  // (scanning, pairing, start-up errors).
+  int connectedCount = 0;
+  for (int i = 0; i < CONTROLLER_MAX_PADS; i++) {
+    controller_state_t pad = {0};
+    controller_getPadState(i, &pad);
+    if (!pad.connected) {
+      continue;
+    }
+    connectedCount++;
+    char line[TERM_SCREEN_SIZE_X + 1];
+    int n = snprintf(line, sizeof(line), "%d %s", i + 1,
+                     (pad.deviceName[0] != '\0') ? pad.deviceName
+                                                  : "Controller");
+    size_t lineLen = (n < 0) ? 0 : (size_t)n;
+    // Down the left column, then the right; each kept inside its column.
+    size_t col = (i < PAD_LIST_ROWS) ? LEFT_MARGIN : SECOND_COLUMN;
+    size_t room = ((i < PAD_LIST_ROWS) ? SECOND_COLUMN - 1
+                                       : TERM_SCREEN_SIZE_X - 1) - col;
+    if (lineLen > room) lineLen = room;
+    memcpy(currentLines[PAD_LIST_ROW + (i % PAD_LIST_ROWS)] + col, line,
+           lineLen);
   }
-  size_t statusLen = strlen(status);
-  if (statusLen > TERM_SCREEN_SIZE_X) statusLen = TERM_SCREEN_SIZE_X;
-  memcpy(currentLines[2], status, statusLen);
+  if (connectedCount == 0) {
+    const char *status = (state->status[0] != '\0') ? state->status : "N/A";
+    size_t statusLen = strlen(status);
+    if (statusLen > TERM_SCREEN_SIZE_X - 1 - LEFT_MARGIN) {
+      statusLen = TERM_SCREEN_SIZE_X - 1 - LEFT_MARGIN;
+    }
+    memcpy(currentLines[PAD_LIST_ROW] + LEFT_MARGIN, status, statusLen);
+  }
 
-  // Auto-exit countdown message, one line below the status/name line. Shown
-  // only while the countdown is running; when it is not, row 3 stays blank and
+  // How many are connected, set into the top right of the title rule
+  // (--MD/Sidepad-----Connected:2--), ending where the version does on the
+  // bottom rule. Part of the grid, so the diff redraws it when it changes.
+  {
+    char count[16];
+    int n = snprintf(count, sizeof(count), "Connected:%d", connectedCount);
+    size_t countLen = (n < 0) ? 0 : (size_t)n;
+    if (countLen < RULE_TEXT_END - titleLead - titleLen) {
+      memcpy(currentLines[0] + RULE_TEXT_END - countLen, count, countLen);
+    }
+  }
+
+  // Auto-exit countdown message, below the visualiser titles. Shown only
+  // while the countdown is running; when it is not, the row stays blank and
   // the line diff clears any previous message.
   if (autoExitActive) {
     int64_t remUs =
@@ -361,8 +456,11 @@ static void renderControllerScreen(const controller_state_t *state,
     int n = snprintf(countdown, sizeof(countdown),
                      "Exit in %ds (any key to cancel)", secs);
     size_t countdownLen = (n < 0) ? 0 : (size_t)n;
-    if (countdownLen > TERM_SCREEN_SIZE_X) countdownLen = TERM_SCREEN_SIZE_X;
-    memcpy(currentLines[3], countdown, countdownLen);
+    if (countdownLen > TERM_SCREEN_SIZE_X - 1 - LEFT_MARGIN) {
+      countdownLen = TERM_SCREEN_SIZE_X - 1 - LEFT_MARGIN;
+    }
+    memcpy(currentLines[COUNTDOWN_ROW] + LEFT_MARGIN, countdown,
+           countdownLen);
   }
 
   // Visualiser. Both titles are always on screen and carry their own state,
@@ -406,38 +504,56 @@ static void renderControllerScreen(const controller_state_t *state,
   // area (everything between the title row and the bottom rule) with the static
   // help text. Drawn last so it overwrites the status/visualiser written above;
   // the shared title and footer rows are untouched. Content area is rows
-  // 1..UI_ROW_COUNT-3 (20 rows), 40 columns; keep every line within both.
+  // 1..UI_ROW_COUNT-3 (21 rows), 80 columns. A row has a left half and an
+  // optional right half starting at SECOND_COLUMN, which is how the keys sit
+  // in two columns, read down the left one and then the right; keep the left
+  // half short of SECOND_COLUMN. The keys are in the footer's order (Help,
+  // Esc, Booster, Reset, Hook, Xpad), then the two the visualiser titles show.
   if (helpVisible) {
-    static const char *const helpLines[] = {
-        "",
-        "Use your Bluetooth gamepad as an Atari",
-        "ST joystick and/or mouse, and a",
-        "controller for games that support Xpad",
-        "",
-        "P    Pair a new controller",
-        "J    Joystick on/off",
-        "M    Right stick as mouse on/off",
-        "X    Xpad on/off",
-        "H    Toggle joystick hook (see below)",
-        "ESC  Exit to desktop and play!",
-        "B    Return to Booster",
-        "",
-        "Choose between 2 joystick hooks:",
-        "",
-        "ETV  Works with most apps and games",
-        "VBL  Great for GEM and TOS apps",
-        "",
-        "Web  neilrackett.com/atarist",
+    static const struct {
+      const char *left;
+      const char *right;
+    } helpLines[] = {
+        {"", NULL},
+        {"Pair up to 4 Bluetooth gamepads. Pad 1 is your ST joystick", NULL},
+        {"and/or mouse, and all 4 work in games that support Xpad", NULL},
+        {"", NULL},
+        {"Help Show or hide this page",
+         "H    Toggle joystick hook (see below)"},
+        {"ESC  Exit to desktop and play!", "X    Xpad on/off"},
+        {"B    Return to Booster", "J    Joystick on/off"},
+        {"R    Reset: forget all pads", "M    Right stick as mouse on/off"},
+        {"", NULL},
+        {"", NULL},
+        {"Choose between 2 joystick hooks:", NULL},
+        {"", NULL},
+        {"ETV  Works with most apps and games", NULL},
+        {"VBL  Great for GEM and TOS apps", NULL},
     };
+    // On the row the main screen's countdown uses, rather than counted down
+    // from the top, so the two stay level whatever the list above holds.
+    static const char helpWeb[] = "Web  neilrackett.com/atarist";
     for (uint8_t row = 1; row <= UI_ROW_COUNT - 3; row++) {
       memset(currentLines[row], ' ', TERM_SCREEN_SIZE_X);
     }
     for (size_t i = 0; i < sizeof(helpLines) / sizeof(helpLines[0]); i++) {
       if (1 + i > (size_t)(UI_ROW_COUNT - 3)) break;  // don't stomp the footer
-      size_t len = strlen(helpLines[i]);
-      if (len > TERM_SCREEN_SIZE_X) len = TERM_SCREEN_SIZE_X;
-      memcpy(currentLines[1 + i], helpLines[i], len);
+      size_t len = strlen(helpLines[i].left);
+      if (len > TERM_SCREEN_SIZE_X - 1 - LEFT_MARGIN) {
+        len = TERM_SCREEN_SIZE_X - 1 - LEFT_MARGIN;
+      }
+      memcpy(currentLines[1 + i] + LEFT_MARGIN, helpLines[i].left, len);
+      if (helpLines[i].right != NULL) {
+        // The last column is never drawn, so the right half stops short of it.
+        len = strlen(helpLines[i].right);
+        if (len > TERM_SCREEN_SIZE_X - 1 - SECOND_COLUMN) {
+          len = TERM_SCREEN_SIZE_X - 1 - SECOND_COLUMN;
+        }
+        memcpy(currentLines[1 + i] + SECOND_COLUMN, helpLines[i].right, len);
+      }
     }
+    memcpy(currentLines[COUNTDOWN_ROW] + LEFT_MARGIN, helpWeb,
+           sizeof(helpWeb) - 1);
   }
 
   // Bottom two rows: a horizontal rule then the controls. Each
@@ -446,21 +562,20 @@ static void renderControllerScreen(const controller_state_t *state,
   // sits mid-cell, rather than '_' (cell bottom) so the rule clears the
   // controls text below it.
   memset(currentLines[UI_ROW_COUNT - 2], GLYPH_H, TERM_SCREEN_SIZE_X);
-  // Overlay the build version near the right end of the rule (----vX.Y.Z--).
-  // appendLineAt renders TERM_SCREEN_SIZE_X - 1 cells, so anchor to that and
-  // leave two trailing rule cells after the version.
+  // Overlay the build version near the right end of the rule (----vX.Y.Z--),
+  // ending at RULE_TEXT_END like the controller count on the title rule.
   const char *version = RELEASE_VERSION;
   size_t versionLen = strlen(version);
-  if (versionLen + 2 < (size_t)(TERM_SCREEN_SIZE_X - 1)) {
-    size_t versionCol = (size_t)(TERM_SCREEN_SIZE_X - 1) - 2 - versionLen;
-    memcpy(currentLines[UI_ROW_COUNT - 2] + versionCol, version, versionLen);
+  if (versionLen < RULE_TEXT_END) {
+    memcpy(currentLines[UI_ROW_COUNT - 2] + RULE_TEXT_END - versionLen,
+           version, versionLen);
   }
   // The controls footer (bottom row) is emitted separately below with the key
   // names in reverse video, so it is not part of this plain-char grid (the
   // ESC p/q codes are not fixed-width cells).
 
-  char updates[UPDATES_SIZE] = {0};
   size_t offset = 0;
+  updates[0] = '\0';
 
   if (forceFullRefresh) {
     appendFmt(updates, sizeof(updates), &offset,
@@ -499,6 +614,7 @@ static void renderControllerScreen(const controller_state_t *state,
   // persists across partial refreshes (the grid never repaints this row).
   if (forceFullRefresh) {
     appendMoveAndClearLine(updates, sizeof(updates), &offset, UI_ROW_COUNT - 1);
+    appendFmt(updates, sizeof(updates), &offset, "%*s", LEFT_MARGIN, "");
     appendFmt(updates, sizeof(updates), &offset,
               "\x1B"
               "p"
@@ -520,10 +636,10 @@ static void renderControllerScreen(const controller_state_t *state,
               "ooster "
               "\x1B"
               "p"
-              "P"
+              "R"
               "\x1B"
               "q"
-              "air "
+              "eset "
               "\x1B"
               "p"
               "H"
@@ -620,7 +736,7 @@ static void writeBtJoyState(void) {
   // before the toggle. Xpad is untouched by this; it has its own path.
   if (!joystickMode) bt = 0;
 
-  uint32_t romBase = (uint32_t)&__rom_in_ram_start__;
+  uintptr_t romBase = (uintptr_t)&__rom_in_ram_start__;
   SET_SHARED_VAR(SIDEPAD_BT_JOY_SLOT, (uint32_t)bt, romBase,
                  CHANDLER_SHARED_VARIABLES_OFFSET);
 }
@@ -630,18 +746,29 @@ static void writeBtJoyState(void) {
 // SIDEPAD_MOUSE_MAX_SPEED at full deflection. The blend (0.5*t + 0.5*t^2)
 // halves the slope near the deadzone edge -> half the minimum speed for finer
 // slow control, while full deflection still reaches the same max.
-static int8_t mouseAxisDelta(float axis) {
+//
+// The IKBD moves in whole pixels, and at 50 frames a second even one pixel a
+// frame is 50 pixels a second, so the fraction a frame does not move is
+// carried into the next: a gentle push creeps rather than lurching. The carry
+// is dropped inside the deadzone, so letting go stops the cursor dead rather
+// than letting it coast a pixel.
+static float mouseCarryX = 0.0f;
+static float mouseCarryY = 0.0f;
+
+static int8_t mouseAxisDelta(float axis, float *carry) {
   float off = axis - 0.5f;  // -0.5 .. +0.5
   float mag = off < 0.0f ? -off : off;
   if (mag <= SIDEPAD_MOUSE_DEADZONE) {
+    *carry = 0.0f;
     return 0;
   }
   float t = (mag - SIDEPAD_MOUSE_DEADZONE) / (0.5f - SIDEPAD_MOUSE_DEADZONE);
   if (t > 1.0f) t = 1.0f;  // clamp to full deflection
-  float scaled = (0.5f * t + 0.5f * t * t) * (float)SIDEPAD_MOUSE_MAX_SPEED;
-  int delta = (int)(scaled + 0.5f);
-  if (delta > SIDEPAD_MOUSE_MAX_SPEED) delta = SIDEPAD_MOUSE_MAX_SPEED;
-  return (int8_t)(off < 0.0f ? -delta : delta);
+  float scaled = (0.5f * t + 0.5f * t * t) * SIDEPAD_MOUSE_MAX_SPEED;
+  float v = *carry + (off < 0.0f ? -scaled : scaled);
+  int delta = (int)v;  // toward zero; the rest is carried
+  *carry = v - (float)delta;
+  return (int8_t)delta;
 }
 
 // Publish the right-stick-as-mouse packet to the shared region for the m68k VBL
@@ -660,13 +787,16 @@ static void writeBtMouseState(void) {
   // change to the rest state cannot quietly start moving the cursor.
   if (mouseMode && st.connected) {
     enabled = 1;
-    dx = mouseAxisDelta(st.rx);
-    dy = mouseAxisDelta(st.ry);
+    dx = mouseAxisDelta(st.rx, &mouseCarryX);
+    dy = mouseAxisDelta(st.ry, &mouseCarryY);
     if (st.btnRS) buttons |= 0x02;  // IKBD left button = bit 1 ($FA header)
+  } else {
+    mouseCarryX = 0.0f;
+    mouseCarryY = 0.0f;
   }
   uint32_t v = ((uint32_t)enabled << 24) | ((uint32_t)buttons << 16) |
                ((uint32_t)(uint8_t)dx << 8) | (uint32_t)(uint8_t)dy;
-  uint32_t romBase = (uint32_t)&__rom_in_ram_start__;
+  uintptr_t romBase = (uintptr_t)&__rom_in_ram_start__;
   SET_SHARED_VAR(SIDEPAD_BT_MOUSE_SLOT, v, romBase,
                  CHANDLER_SHARED_VARIABLES_OFFSET);
 
@@ -687,7 +817,7 @@ static void writeBtMouseState(void) {
 static void writeExitMessage(void) {
   controller_state_t st = {0};
   controller_getState(&st);
-  uint32_t romBase = (uint32_t)&__rom_in_ram_start__;
+  uintptr_t romBase = (uintptr_t)&__rom_in_ram_start__;
 
   // Connection state -> slot 4 (m68k boot_gem picks the banner from ROM).
   SET_SHARED_VAR(SIDEPAD_EXIT_FLAG_SLOT, st.connected ? 1u : 0u, romBase,
@@ -755,13 +885,13 @@ static void exitToGemDesktop(void) {
   // terminal, which has just exited, and the banner is not read until the
   // m68k's first CMD_START after this.
   SET_SHARED_VAR(SIDEPAD_JOY_ENABLED_SLOT, joystickMode ? 1u : 0u,
-                 (uint32_t)&__rom_in_ram_start__,
+                 (uintptr_t)&__rom_in_ram_start__,
                  CHANDLER_SHARED_VARIABLES_OFFSET);
   // And the Xpad flag, latched here for the same reason: the installer reads
   // it on the first CMD_START below to decide whether to put the cookie in the
   // jar, and X can only be pressed in the terminal we have just left.
   SET_SHARED_VAR(SIDEPAD_XPAD_ENABLED_SLOT, xpadMode ? 1u : 0u,
-                 (uint32_t)&__rom_in_ram_start__,
+                 (uintptr_t)&__rom_in_ram_start__,
                  CHANDLER_SHARED_VARIABLES_OFFSET);
   // Lay down the Xpad block before the m68k installer runs, because the same
   // CMD_START burst that installs the hook also installs the cookie pointing
@@ -774,6 +904,11 @@ static void exitToGemDesktop(void) {
     xpadstate_publish();
   }
   for (int i = 0; i < SIDEPAD_HOOK_START_TICKS; i++) {
+    // The installer this starts sends APP_XPAD_REQ_ADDR and waits to see it
+    // answered before it puts the cookie in, so commands must be heard here,
+    // not only once the forever loop below starts. The same goes for the
+    // burst after this one, which a warm reset can land in.
+    chandler_loop();
     SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
     writeBtJoyState();
     writeBtMouseState();  // publish before the hook starts reading slot 5
@@ -792,6 +927,7 @@ static void exitToGemDesktop(void) {
   // the terminal (the symptom: the firmware-load message flashes, then the
   // terminal returns). Repeating it guarantees boot_gem latches.
   for (int i = 0; i < SIDEPAD_BOOT_GEM_TICKS; i++) {
+    chandler_loop();
     SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_CONTINUE);
     writeBtJoyState();
     writeBtMouseState();
@@ -803,6 +939,7 @@ static void exitToGemDesktop(void) {
   // mouse mode is on, the mouse packet) the resident VBL hook reads.
   while (true) {
     chandler_loop();
+    rumble_tick();
     controller_poll();
     writeBtJoyState();
     writeBtMouseState();
@@ -829,8 +966,10 @@ static void handleUiKeystroke(char keystroke) {
     refreshControllerUI(true);
   }
   switch (tolower((unsigned char)keystroke)) {
-    case 'p':
-      DPRINTF("Pair requested\n");
+    case 'r':
+      // Reset: disconnect every pad and forget every bond. Not needed to add
+      // a pad, since pairing is always open; this is for starting again.
+      DPRINTF("Reset requested: forgetting every pad\n");
       controller_requestPairing();
       break;
     case 'm':
@@ -900,10 +1039,12 @@ static void sidepadInputCb(TransmissionProtocol *protocol,
   }
   // Any key cancels a running auto-exit countdown, and keeps it cancelled for
   // the rest of the session. Only mark cancelled when one was actually running,
-  // so keys pressed before the first connect (e.g. [P] to pair) don't suppress
+  // so keys pressed before the first connect (e.g. [R] to reset) don't suppress
   // the first countdown. Keys with actions (p/m/x/esc) still perform them
-  // below.
-  if (autoExitActive) {
+  // below. Only the terminal's own commands are keys: the Xpad ones come from
+  // the resident hook, once the terminal has gone.
+  if (autoExitActive && ((protocol->command_id == APP_TERMINAL_START) ||
+                         (protocol->command_id == APP_TERMINAL_KEYSTROKE))) {
     autoExitActive = false;
     autoExitCancelled = true;
   }
@@ -930,6 +1071,23 @@ static void sidepadInputCb(TransmissionProtocol *protocol,
       handleUiKeystroke((char)(payload32 & TERM_KEYBOARD_KEY_MASK));
       break;
     }
+    case APP_XPAD_REQ_ADDR:
+      // With Xpad off there is no block to point into, and the installer
+      // does not ask; ignore a stray one rather than write into the window.
+      if (xpadMode && (payloadPtr != NULL) && (protocol->payload_size >= 8)) {
+        uint32_t addr = TPROTO_GET_PAYLOAD_PARAM32(payloadPtr);
+        xpadstate_setReq(addr);
+        // A new request area means a new session, after a cold boot or a
+        // reset: stop whatever the last one left running.
+        rumble_reset();
+        DPRINTF("Xpad: req at 0x%08lX\n", (unsigned long)addr);
+      }
+      break;
+    case APP_XPAD_RUMBLE:
+      if ((payloadPtr != NULL) && (protocol->payload_size >= 12)) {
+        rumble_onFrame(payloadPtr);
+      }
+      break;
     default:
       break;
   }

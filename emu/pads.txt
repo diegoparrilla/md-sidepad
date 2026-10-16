@@ -1,0 +1,6 @@
+# Controllers for make emu, played through EmuMD's Bluetooth stand-in.
+# The format is in emu/test/pads.txt. Player 1 connecting starts the
+# auto-exit countdown, as on a real ST; any key cancels it.
+1000 0 connect Xbox Wireless Controller
+2500 1 connect DualSense Wireless Controller
+4000 2 connect Pro Controller

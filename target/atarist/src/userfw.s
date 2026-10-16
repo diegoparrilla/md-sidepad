@@ -29,14 +29,35 @@
 ; VBL vs ETV hook (selectable at install time)
 ; --------------------------------------------
 ; The RP publishes a hook-mode flag to shared-var slot 6 (HOOK_FLAG_ADDR) before
-; the installer runs: 0 = VBL, 1 = ETV. VBL ($70) fires every vsync (~50 Hz) and
-; is the default. ETV (etv_timer, $400) is a TOS subroutine vector called from the
-; MFP Timer C interrupt at ~200 Hz; it survives programs that replace the VBL
-; vector, but we only need ~50 Hz so the ETV entry injects on every ETV_DIVISOR'th
-; tick (4 -> ~50 Hz) and chains the rest. Both entries share one injection routine
-; and the same `push orig; rts` chain, valid for the $70 autovector (the saved
+; the installer runs: 0 = VBL, 1 = ETV. VBL ($70) fires every vsync (50, 60 or
+; 71 Hz with the display). ETV (etv_timer, $400) is a TOS subroutine vector,
+; and the default: it survives programs that replace the VBL vector. TOS calls
+; it from the MFP Timer C interrupt, but only on every fourth of Timer C's
+; 200 Hz ticks, so 50 Hz, the IKBD's own rate, and the ETV entry injects on
+; every call. (It once divided by four again on the belief that etv_timer ran
+; at 200 Hz, which left ETV mode injecting at 12.5 Hz. Measured under TOS
+; 1.62, 2.06 and EmuTOS: 50 Hz.) Both entries share one injection routine and
+; the same `push orig; rts` chain, valid for the $70 autovector (the saved
 ; original rte's the interrupt frame) and the $400 subroutine (the saved original
 ; rts's back to TOS' MFP ISR, which rte's).
+;
+;
+; Xpad rumble
+; -----------
+; A game asks for rumble by writing levels into an XPAD_REQ area and bumping
+; its seq. The block lives in the read-only cartridge window, so the request
+; area cannot: it is res_req, inside the RAM block below. The installer sends
+; its address to the RP (APP_XPAD_REQ_ADDR) and waits to see it come back as
+; the block's req pointer before it puts the cookie in, so no consumer can
+; find the block without it. From then on the resident hook forwards all four
+; pads' levels as one APP_XPAD_RUMBLE frame when seq moves, and again every
+; RQ_KEEPALIVE (200 ms) while any motor is on. The RP stops a pad whose frames
+; stop arriving, which is what keeps an ST reset, or a game that unhooks us,
+; from leaving a motor running. See rp/src/include/rumble.h.
+;
+; Frames go to the RP the way the terminal's send_sync sends them, as reads
+; in ROM3 whose low address bits are the data, but nothing is waited for:
+; this runs in an interrupt, and the next frame repairs a lost one.
 ;
 ; Why copy to RAM
 ; ---------------
@@ -54,8 +75,7 @@ XBIOS_Kbdvbase      equ 34          ; trap #14 -> KBDVECS pointer in d0
 KBDVECS_JOYVEC_OFF  equ 24          ; joyvec field within KBDVECS (offset 24!)
 KBDVECS_MOUSEVEC_OFF equ 16         ; mousevec field within KBDVECS
 VBL_VECTOR          equ $70         ; .l  level-4 (VBL) autovector
-ETV_TIMER_VECTOR    equ $400        ; .l  etv_timer subroutine vector (MFP Timer C, ~200 Hz)
-ETV_DIVISOR         equ 4           ; ETV ticks per injection: ~200 Hz / 4 = ~50 Hz (match VBL)
+ETV_TIMER_VECTOR    equ $400        ; .l  etv_timer subroutine vector (every 4th Timer C tick, 50 Hz)
 BT_JOY_BYTE         equ $FA201F     ; LSB of shared-var slot 3 (RP writes it)
 HOOK_FLAG_ADDR      equ $FA202B     ; LSB of shared-var slot 6: 0 = VBL ($70), 1 = ETV ($400)
 XPAD_FLAG_ADDR      equ $FA2033     ; LSB of shared-var slot 8: 1 = publish the Xpad cookie
@@ -65,6 +85,25 @@ BT_MOUSE_ENABLED    equ $FA2024     ; mouse mode on (1) / off (0)
 BT_MOUSE_BTN        equ $FA2025     ; IKBD button bits (bit1 = left button / R3)
 BT_MOUSE_DX         equ $FA2026     ; signed per-frame dx
 BT_MOUSE_DY         equ $FA2027     ; signed per-frame dy
+
+; ROM3 commands to the RP, for Xpad rumble. Must match APP_XPAD_* in
+; rp/src/emul.c, which describes the payloads; well clear of the terminal's
+; 0 (ESC) and 1 (keystroke).
+APP_XPAD_REQ_ADDR   equ $5850       ; payload: XPAD_REQ address, low word first
+APP_XPAD_RUMBLE     equ $5851       ; payload: four words, lo << 8 | hi per pad
+ROM3_CMD_ADDR       equ $FB8000     ; middle of ROM3: (a0,dN.w) reaches all 64 KB
+CMD_HEADER          equ $ABCD       ; starts every command, as in main.s
+FRCLOCK             equ $466        ; _frclock: VBLs since boot (supervisor)
+HZ200               equ $4BA        ; _hz_200: 5 ms ticks since boot (supervisor)
+
+; Rumble timing is measured on _hz_200, not in hook ticks: the hook runs at
+; the display's rate on VBL (50, 60 or 71 Hz) and at etv_timer's 50 Hz on
+; ETV, and the RP's timeout is in real time.
+RQ_MIN_GAP          equ 6           ; 30 ms between two different frames
+RQ_KEEPALIVE        equ 40          ; 200 ms between keepalives
+HS_FRAMES           equ 50          ; frames to wait for the RP (~1 s)
+HS_RESEND           equ 8           ; resend the address every 8 frames (2^n)
+HS_SPIN             equ 4000        ; cap on one frame's wait, ~15 ms at 8 MHz
 
 ; Xpad block, published by the RP into APP_FREE. Consumers find it through
 ; the cookie jar and read it straight out of the window: no copy, no hook,
@@ -76,6 +115,11 @@ BT_MOUSE_DY         equ $FA2027     ; signed per-frame dy
     include "xpad.inc"
 
 XPAD_BLOCK          equ $FA2300     ; the block itself, in the cartridge window
+; The block's req pointer, which the RP fills in from APP_XPAD_REQ_ADDR.
+; xpad.inc stops at XPAD_HDR_FIXED because pointer sizes differ between
+; machines; on the m68k provider then req follow it, 4 bytes each. Pinned
+; on the RP side by a _Static_assert on OFF_REQ in xpadstate.c.
+XPAD_REQ_PTR_ADDR   equ (XPAD_BLOCK+XPAD_HDR_FIXED+4)
 
 ; -----------------------------------------------------------------------
 ; Installer — runs from ROM at USERFW ($FA0800). Only writes to RAM.
@@ -83,17 +127,7 @@ XPAD_BLOCK          equ $FA2300     ; the block itself, in the cartridge window
 ; a3 holds the RAM block base across the trap calls: GEMDOS/XBIOS may clobber
 ; d0-d2/a0-a2, but preserve d3-d7/a3-a6, so a3 survives the traps below.
 userfw:
-    movem.l d0-d2/a0-a3, -(sp)
-
-    ; Publish the Xpad cookie first. It is independent of everything below:
-    ; the block lives in the cartridge window, not in the RAM block, so it
-    ; should go in even if the Malloc fails and no hook gets installed.
-    ; Skipped entirely when the RP has Xpad turned off (slot 8): it publishes
-    ; no block then, so a cookie here would point at empty window.
-    tst.b   XPAD_FLAG_ADDR
-    beq.s   .uf_no_xpad
-    bsr     install_xpad_cookie
-.uf_no_xpad:
+    movem.l d0-d4/a0-a3, -(sp)
 
     ; Malloc a RAM block for the resident handler + its state.
     move.l  #(resident_end-resident_start), -(sp)
@@ -101,7 +135,7 @@ userfw:
     trap    #1
     addq.l  #6, sp
     tst.l   d0
-    beq.s   .uf_exit                ; out of memory -> install nothing
+    beq     .uf_cookie_only         ; out of memory -> no hook, no rumble
     move.l  d0, a3                  ; a3 = RAM block base (survives traps)
 
     ; Copy the resident code+data (in ROM) into the RAM block.
@@ -128,6 +162,16 @@ userfw:
     move.l  d0, a0
     lea     KBDVECS_MOUSEVEC_OFF(a0), a0
     move.l  a0, (res_mouseslot-resident_start)(a3)
+
+    ; Publish the Xpad cookie, after telling the RP where our request area
+    ; is: a consumer finding the block must find its req pointer filled in.
+    ; Both are skipped when the RP has Xpad turned off (slot 8): it
+    ; publishes no block then, so a cookie would point at empty window.
+    tst.b   XPAD_FLAG_ADDR
+    beq.s   .uf_hook
+    bsr     req_handshake
+    bsr     install_xpad_cookie
+.uf_hook:
 
     ; Hook either the VBL autovector ($70) or the etv_timer subroutine vector
     ; ($400), per the hook-mode flag the RP published to slot 6 (HOOK_FLAG_ADDR):
@@ -162,9 +206,62 @@ userfw:
     ; shared-region string), not here -- printing from the installer would land
     ; back in the terminal print loop and be repainted over. This routine only
     ; installs the joystick hook.
+    bra.s   .uf_exit
+
+.uf_cookie_only:
+    ; No RAM block, so no hook and nowhere for a request area, but the block
+    ; itself is in the cartridge window and still worth publishing: req stays
+    ; NULL, so no consumer is offered rumble.
+    tst.b   XPAD_FLAG_ADDR
+    beq.s   .uf_exit
+    bsr     install_xpad_cookie
 
 .uf_exit:
-    movem.l (sp)+, d0-d2/a0-a3
+    movem.l (sp)+, d0-d4/a0-a3
+    rts
+
+; -----------------------------------------------------------------------
+; Tell the RP where the XPAD_REQ area in the RAM block is, and wait until
+; the block's req pointer says so: the RP writes it from the command, and
+; seeing it there is the only acknowledgement there is. On success the
+; resident starts forwarding rumble (RQ_ON); on a timeout it never does,
+; and req stays as the RP last had it.
+;
+; Waits a frame at a time on _frclock, resending every HS_RESEND frames in
+; case one was lost, for at most HS_FRAMES frames. Each frame's wait is
+; also capped (HS_SPIN), so a stopped VBL can slow the boot down but never
+; hang it. In: a3 = RAM block. Clobbers d0-d4/a0-a1.
+; -----------------------------------------------------------------------
+req_handshake:
+    move.l  a3, d4
+    add.l   #(res_req-resident_start), d4   ; d4 = our XPAD_REQ's address
+    lea     (res_ad_frame-resident_start+8)(a3), a1
+    move.w  d4, (a1)                ; payload: low word first,
+    swap    d4
+    move.w  d4, 2(a1)               ; then the high word
+    swap    d4
+    moveq   #0, d3                  ; frames waited
+.hs_send:
+    lea     (res_ad_frame-resident_start)(a3), a1
+    bsr     res_send                ; the ROM copy: it only reads, so fine
+.hs_wait:
+    move.l  FRCLOCK.w, d0
+    move.w  #HS_SPIN, d1
+.hs_vbl:
+    cmp.l   FRCLOCK.w, d0
+    dbne    d1, .hs_vbl             ; until the next VBL, or the cap
+    cmp.l   XPAD_REQ_PTR_ADDR, d4
+    beq.s   .hs_ok                  ; the RP has it
+    addq.w  #1, d3
+    cmp.w   #HS_FRAMES, d3
+    bhs.s   .hs_done                ; give up: no rumble this session
+    move.w  d3, d0
+    and.w   #(HS_RESEND-1), d0
+    beq.s   .hs_send
+    bra.s   .hs_wait
+.hs_ok:
+    move.b  #1, (res_rq-resident_start+RQ_ON)(a3)
+.hs_done:
     rts
 
 ; -----------------------------------------------------------------------
@@ -221,7 +318,7 @@ install_xpad_cookie:
 ; touch and tail-chain into the saved original handler.
 ; -----------------------------------------------------------------------
     even
-; VBL autovector ($70) entry: fires every vsync (~50 Hz). Inject, then chain.
+; VBL autovector ($70) entry: fires every vsync. Inject, then chain.
 resident_start:
     ; Save the FULL register set, not just our scratch: we jsr into the system
     ; joyvec/mousevec, and mousevec (line-A / AES cursor machinery) can clobber
@@ -232,14 +329,10 @@ resident_start:
     bra     res_chain
 
     even
-; etv_timer ($400) entry: TOS' MFP Timer C calls this ~200 Hz. We only want
-; ~50 Hz, so inject on every ETV_DIVISOR'th tick and chain the rest.
+; etv_timer ($400) entry: TOS calls this at 50 Hz, from every fourth Timer C
+; tick. Inject, then fall through to the chain.
 resident_etv_start:
     movem.l d0-d7/a0-a6, -(sp)
-    lea     etv_div(pc), a0
-    subq.b  #1, (a0)
-    bgt     res_chain               ; not the Nth tick yet -> skip injection
-    move.b  #ETV_DIVISOR, (a0)      ; reload the divider for the next group
     bsr     do_inject
 
 ; Shared chain tail: restore registers and jump to the saved original handler.
@@ -330,6 +423,89 @@ do_inject:
     jsr     (a1)                    ; mousevec convention: a0 -> [header, dx, dy]
     move.w  (sp)+, sr
 .di_done:
+    bsr     do_rumble
+    rts
+
+    even
+; do_rumble — forward the request area to the RP. Sends the whole state, all
+; four pads, never a change, because the RP holds one pending command and can
+; drop a frame: the next one must be enough on its own. Sends when seq moves
+; (at most every RQ_MIN_GAP, longer than the RP's 20 ms poll, so two
+; different frames cannot land in one poll and lose the second), and every
+; RQ_KEEPALIVE while any motor is on, plus once more after they all go off in
+; case that stop was the frame that got lost. Nothing at all until a consumer
+; first bumps seq, so the terminal and the desktop see no ROM3 traffic from
+; here. Free to clobber registers: do_inject's callers saved them all.
+do_rumble:
+    lea     res_rq(pc), a2
+    tst.b   RQ_ON(a2)
+    beq.s   .dr_done                ; no request area confirmed: nothing to do
+    move.l  HZ200.w, d4             ; now
+    move.l  d4, d5
+    sub.l   RQ_LAST(a2), d5         ; 5 ms ticks since the last frame
+    lea     res_req(pc), a3
+    move.b  2(a3), d3               ; req.seq, read before the levels
+    cmp.b   RQ_SEEN(a2), d3
+    beq.s   .dr_keepalive
+    cmp.l   #RQ_MIN_GAP, d5
+    bhs.s   .dr_send                ; changed, and far enough from the last
+.dr_keepalive:
+    cmp.l   #RQ_KEEPALIVE, d5
+    blo.s   .dr_done                ; not due yet
+    tst.b   RQ_NZ(a2)
+    bne.s   .dr_send                ; a motor is on: keep it on
+    tst.b   RQ_QUIET(a2)
+    beq.s   .dr_done                ; all off, and the stop already repeated
+.dr_send:
+    move.b  d3, RQ_SEEN(a2)
+    move.l  d4, RQ_LAST(a2)
+    lea     4(a3), a0               ; req.rumble[0][0]
+    lea     res_rq_frame+8(pc), a1  ; the frame's four payload words
+    moveq   #0, d0
+    move.l  (a0)+, d1               ; pads 0 and 1
+    move.l  d1, (a1)+
+    or.l    d1, d0
+    move.l  (a0), d1                ; pads 2 and 3
+    move.l  d1, (a1)
+    or.l    d1, d0
+    sne     d0                      ; d0.b = $FF if any motor is on
+    move.b  RQ_NZ(a2), d1           ; what the last frame said
+    move.b  d0, RQ_NZ(a2)
+    not.b   d0
+    and.b   d0, d1                  ; on before, all off now: owe one repeat
+    move.b  d1, RQ_QUIET(a2)
+    lea     res_rq_frame(pc), a1
+    bsr.s   res_send
+.dr_done:
+    rts
+
+    even
+; res_send — one command to the RP over ROM3: header, command, size, the
+; payload words, then the checksum (command + size + every payload word).
+; Each word is the low 16 bits of a read's address, which the RP's PIO
+; captures; the read itself returns nothing of interest. Nothing is waited
+; for. Position independent, and only reads memory, so the installer can
+; call the copy in ROM. In: a1 -> command.w, size.w, then size/2 words.
+; Clobbers d0-d2/a0-a1.
+res_send:
+    move.l  #ROM3_CMD_ADDR, a0
+    move.w  #CMD_HEADER, d0
+    tst.b   (a0,d0.w)               ; header, not in the checksum
+    move.w  (a1)+, d0               ; command
+    move.w  d0, d2
+    tst.b   (a0,d0.w)
+    move.w  (a1)+, d0               ; payload size in bytes, token included
+    add.w   d0, d2
+    tst.b   (a0,d0.w)
+    move.w  d0, d1
+    lsr.w   #1, d1
+    subq.w  #1, d1                  ; words - 1, for dbf
+.rs_word:
+    move.w  (a1)+, d0
+    add.w   d0, d2
+    tst.b   (a0,d0.w)
+    dbf     d1, .rs_word
+    tst.b   (a0,d2.w)               ; checksum
     rts
 
     even
@@ -351,8 +527,32 @@ res_mpkt:
 res_mouseslot:
     dc.l    0
     even
-etv_div:
-    dc.b    1                      ; ETV tick divider (1 -> inject on first tick)
+; The Xpad request area consumers write, found through the block's req
+; pointer once the RP has it. 16 bytes, laid out as xpad.h's XPAD_REQ, which
+; holds no pointers so is the same on every machine (asserted in xpadstate.c).
+res_req:
+    dc.w    16                      ; size: xpad_req() refuses anything smaller
+    dc.b    0, 0                    ; seq, reserved
+    dc.b    0,0, 0,0, 0,0, 0,0      ; rumble[4][2]: low, high frequency motor
+    dc.b    0,0,0,0                 ; led[4]: not honoured, no XPAD_CAP_LED
+    even
+res_rq_frame:
+    dc.w    APP_XPAD_RUMBLE, 12, 0, 0   ; command, size, token (unused)
+    dc.w    0, 0, 0, 0                  ; pads 0-3, filled in by do_rumble
+    even
+res_ad_frame:
+    dc.w    APP_XPAD_REQ_ADDR, 8, 0, 0  ; command, size, token (unused)
+    dc.w    0, 0                        ; address, filled in by req_handshake
+    even
+; do_rumble's state, at these offsets from res_rq.
+RQ_ON               equ 0           ; byte: the RP has our request area
+RQ_SEEN             equ 1           ; byte: req.seq at the last frame
+RQ_NZ               equ 2           ; byte: the last frame had a motor on ($FF)
+RQ_QUIET            equ 3           ; byte: an all-off frame owes a repeat
+RQ_LAST             equ 4           ; long: _hz_200 at the last frame
+res_rq:
+    dc.b    0, 0, 0, 0
+    dc.l    0
     even
 orig_hook:
     dc.l    0                      ; saved original handler at the hooked vector

@@ -5,7 +5,7 @@
 
 /**
  * File: xpadstate.c
- * Description: Publish the connected controller as an Xpad block.
+ * Description: Publish the connected controllers as an Xpad block.
  *
  * See xpadstate.h for what this is for. xpad.h is the ABI this writes,
  * and it comes from the xpad submodule at the repository root rather
@@ -99,6 +99,16 @@ static void put8(uint32_t off, uint8_t v)
 #define OFF_REQ (OFF_PROVIDER + M68K_PTR_SIZE)
 #define OFF_PADS (OFF_REQ + M68K_PTR_SIZE)
 
+/* userfw.s spells this address out as XPAD_REQ_PTR_ADDR, block + 22, and
+ * polls it during its handshake, so it cannot be allowed to move. */
+_Static_assert(OFF_REQ == 22, "userfw.s XPAD_REQ_PTR_ADDR assumes req at 22");
+
+/* The request area itself is userfw.s's res_req, laid out by hand. XPAD_REQ
+ * holds no pointers, so these hold on the m68k as well as here. */
+_Static_assert(sizeof(XPAD_REQ) == 16, "userfw.s res_req is 16 bytes");
+_Static_assert(offsetof(XPAD_REQ, seq) == 2, "userfw.s reads seq at 2");
+_Static_assert(offsetof(XPAD_REQ, rumble) == 4, "userfw.s reads rumble at 4");
+
 _Static_assert(OFF_MAGIC == offsetof(XPAD, magic), "magic moved");
 _Static_assert(OFF_VERSION == offsetof(XPAD, version), "version moved");
 _Static_assert(OFF_HDR_SIZE == offsetof(XPAD, hdr_size), "hdr_size moved");
@@ -133,6 +143,16 @@ _Static_assert(sizeof(XPAD_PAD) == XPAD_PAD_SIZE_V1, "XPAD_PAD is not v1");
 
 _Static_assert(HDR_SIZE <= XPADSTATE_BLOCK_SIZE,
                "the block does not fit in the space reserved for it");
+
+/* A slot per controller, and no more slots than Xpad allows. */
+_Static_assert(XPADSTATE_PAD_COUNT == CONTROLLER_MAX_PADS,
+               "one Xpad pad per controller slot");
+_Static_assert(XPADSTATE_PAD_COUNT <= XPAD_MAX_PADS, "too many pads for Xpad");
+
+/* Analogue because the sticks are real, hotplug because a Bluetooth pad
+ * comes and goes. Rumble is added by xpadstate_setReq(), once there is a
+ * request area to ask through. */
+#define CAPS_BASE (XPAD_CAP_ANALOG | XPAD_CAP_HOTPLUG)
 
 #define BLK(off) (XPADSTATE_BLOCK_OFFSET + (uint32_t)(off))
 
@@ -242,10 +262,10 @@ void xpadstate_init(void)
   put16(BLK(OFF_PADS_OFFSET), OFF_PADS);
   put16(BLK(OFF_PAD_SIZE), XPAD_PAD_SIZE_V1);
 
-  /* Analogue because the sticks are real, hotplug because a Bluetooth
-   * pad comes and goes. No rumble or LED: req is NULL, and claiming a
-   * capability with nowhere to write it would be a lie. */
-  put16(BLK(OFF_CAPS), XPAD_CAP_ANALOG | XPAD_CAP_HOTPLUG);
+  /* No rumble or LED yet: req is NULL until the ST says where its request
+   * area is, and claiming a capability with nowhere to write it would be a
+   * lie. */
+  put16(BLK(OFF_CAPS), CAPS_BASE);
 
   put16(BLK(OFF_SEQ), 0);
   put8(BLK(OFF_PAD_COUNT), XPADSTATE_PAD_COUNT);
@@ -262,51 +282,62 @@ void xpadstate_init(void)
 
 void xpadstate_publish(void)
 {
-  controller_state_t st = {0};
   uint8_t back = active ^ 1u;
-  uint32_t padOff;
-  uint32_t buttons;
-  uint8_t type, flags;
+  int i;
 
-  controller_getState(&st);
-
-  padOff = BLK(OFF_PADS) +
-           (uint32_t)back * XPADSTATE_PAD_COUNT * XPAD_PAD_SIZE_V1;
-
-  if (st.connected)
+  /*
+   * Every slot, every commit, whether it changed or not. Consumers read
+   * the whole front buffer, so a slot left alone here would show what it
+   * held two commits ago once the buffers flip back.
+   */
+  for (i = 0; i < XPADSTATE_PAD_COUNT; i++)
   {
-    buttons = buttonsFrom(&st);
-    type = XPAD_TYPE_GAMEPAD; /* Bluepad32 knows the family; we do not
-                               * carry it through yet */
-    flags = XPAD_PAD_ANALOG | XPAD_PAD_WIRELESS;
-  }
-  else
-  {
-    /* Nothing paired: an empty slot, not a pad stuck at its last state. */
-    buttons = 0;
-    type = XPAD_TYPE_NONE;
-    flags = 0;
-  }
+    controller_state_t st = {0};
+    uint32_t padOff;
+    uint32_t buttons;
+    uint8_t type, flags;
 
-  put32(padOff + PAD_BUTTONS, buttons);
+    controller_getPadState(i, &st);
 
-  if (st.connected)
-  {
-    put16(padOff + PAD_LX,
-          (uint16_t)(((uint8_t)axisFrom(st.lx) << 8) | (uint8_t)axisFrom(st.ly)));
-    put16(padOff + PAD_RX,
-          (uint16_t)(((uint8_t)axisFrom(st.rx) << 8) | (uint8_t)axisFrom(st.ry)));
-    put16(padOff + PAD_LT,
-          (uint16_t)((triggerFrom(st.lt) << 8) | triggerFrom(st.rt)));
-  }
-  else
-  {
-    put16(padOff + PAD_LX, 0);
-    put16(padOff + PAD_RX, 0);
-    put16(padOff + PAD_LT, 0);
-  }
+    padOff = BLK(OFF_PADS) +
+             ((uint32_t)back * XPADSTATE_PAD_COUNT + (uint32_t)i) *
+                 XPAD_PAD_SIZE_V1;
 
-  put16(padOff + PAD_TYPE, (uint16_t)(((uint16_t)type << 8) | flags));
+    if (st.connected)
+    {
+      buttons = buttonsFrom(&st);
+      type = XPAD_TYPE_GAMEPAD; /* Bluepad32 knows the family; we do not
+                                 * carry it through yet */
+      flags = XPAD_PAD_ANALOG | XPAD_PAD_WIRELESS;
+    }
+    else
+    {
+      /* Nothing in this slot: empty, not a pad stuck at its last state. */
+      buttons = 0;
+      type = XPAD_TYPE_NONE;
+      flags = 0;
+    }
+
+    put32(padOff + PAD_BUTTONS, buttons);
+
+    if (st.connected)
+    {
+      put16(padOff + PAD_LX,
+            (uint16_t)(((uint8_t)axisFrom(st.lx) << 8) | (uint8_t)axisFrom(st.ly)));
+      put16(padOff + PAD_RX,
+            (uint16_t)(((uint8_t)axisFrom(st.rx) << 8) | (uint8_t)axisFrom(st.ry)));
+      put16(padOff + PAD_LT,
+            (uint16_t)((triggerFrom(st.lt) << 8) | triggerFrom(st.rt)));
+    }
+    else
+    {
+      put16(padOff + PAD_LX, 0);
+      put16(padOff + PAD_RX, 0);
+      put16(padOff + PAD_LT, 0);
+    }
+
+    put16(padOff + PAD_TYPE, (uint16_t)(((uint16_t)type << 8) | flags));
+  }
 
   /*
    * Commit, in the order the ABI requires: the back buffer is complete,
@@ -318,4 +349,17 @@ void xpadstate_publish(void)
   put8(BLK(OFF_ACTIVE), back);
 
   active = back;
+}
+
+void xpadstate_setReq(uint32_t m68kAddr)
+{
+  /*
+   * The pointer goes in first, then the capability: a consumer that sees
+   * XPAD_CAP_RUMBLE must also see somewhere to write. Both are single
+   * fields the ST reads whole, and the installer does not put the cookie
+   * in the jar until it has seen this address, so no consumer can be
+   * mid-read of either.
+   */
+  put32(BLK(OFF_REQ), m68kAddr);
+  put16(BLK(OFF_CAPS), m68kAddr ? (CAPS_BASE | XPAD_CAP_RUMBLE) : CAPS_BASE);
 }

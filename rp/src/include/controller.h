@@ -17,6 +17,12 @@
 // Analog triggers (lt/rt, 0..1) count as fire once pulled past this point.
 #define CONTROLLER_TRIGGER_THRESHOLD 0.5f
 
+// Controllers connected at once. A pad's slot is its Bluepad32 device index:
+// the first free one when it connects, kept while it stays connected. Slot 0
+// is player 1, the only pad injected as joystick 1 and the mouse; every slot
+// is published to Xpad. Asserted against CONFIG_BLUEPAD32_MAX_DEVICES.
+#define CONTROLLER_MAX_PADS 4
+
 typedef struct {
   bool initialized;
   bool paired;
@@ -80,7 +86,17 @@ void controller_requestPairing(void);
 // Set the status-line text shown in the controller UI. Used to surface
 // boot/init progress and errors in the same slot as live controller status.
 void controller_setStatus(const char *message);
+// Slot 0's state, which is what joystick and mouse injection and the
+// visualiser show. The same as controller_getPadState(0, outState).
 void controller_getState(controller_state_t *outState);
+// One slot's state, 0..CONTROLLER_MAX_PADS-1. An empty slot reads as
+// disconnected, with its axes at rest.
+void controller_getPadState(int idx, controller_state_t *outState);
+// Drive a connected pad's motors for durationMs. Bluepad32 names them weak
+// (the small, fast motor) and strong. Returns false, doing nothing, for an
+// empty slot or a pad whose driver has no rumble.
+bool controller_playRumble(int idx, uint8_t weak, uint8_t strong,
+                           uint16_t durationMs);
 bool controller_getAndClearRestartRequested(void);
 
 #endif  // CONTROLLER_H

@@ -1,5 +1,57 @@
 # Changelog
 
+## v1.4.0 (unreleased)
+
+### Up to four controllers
+
+MD/Sidepad now connects up to four Bluetooth gamepads at once, and
+publishes all of them in its Xpad block. Each takes the first free pad
+slot when it connects and keeps it while it stays connected, and pads
+with player lights show their number. Pad 1 is still the joystick and
+the mouse; pads 2 to 4 reach games through Xpad. Controllers can join
+at any time, even from the desktop, and `R` (Reset, where `P` for Pair
+used to be) forgets every pad.
+
+### Rumble
+
+Games can rumble the pads through Xpad's request area, which MD/Sidepad
+now offers (`XPAD_CAP_RUMBLE`). The cartridge window is read-only to
+the ST, so the request area lives in the resident handler's RAM, and
+the handler forwards its levels to the Multi-device over ROM3. A level
+holds until the game changes it, and the motors stop by themselves
+about a second after the ST stops asking, so a reset mid-rumble cannot
+leave a pad buzzing.
+
+### An 80-column terminal
+
+The terminal is now 640x200, 80 columns: medium resolution on a colour
+monitor, and high resolution with every line doubled on a mono one, so
+there is room on screen for more than one controller. The controller
+visualisers are drawn twice as wide to stay square in medium
+resolution's tall pixels. The resolution and the one palette colour the
+terminal uses are put back before the desktop starts.
+
+### ETV mode runs at full rate
+
+`etv_timer` is called at 50 Hz, not the 200 Hz MD/Sidepad assumed, so
+dividing it by four left ETV mode, the default, updating the joystick
+and mouse only 12.5 times a second. It now injects on every call, the
+same rate as VBL mode on a PAL display. The mouse's top speed is
+retuned to match (5 pixels per update rather than 20, so the same 250
+pixels a second as before in ETV mode, and a quarter of what VBL mode
+gave), and fractions of a pixel carry over between updates so slow
+movement stays smooth.
+
+### Under the hood
+
+MD/Sidepad now runs on your computer, in Hatari, through
+[EmuMD](https://github.com/neilrackett/emumd): `make emu`, with the
+controllers played from a script, and `make emu-test`, which boots it
+headless and checks the four slots and rumble from an ST program. To
+build for a host, cartridge-window addresses are kept in `uintptr_t`
+(the same as before on the RP2040), the payload store in `tprotocol.h`
+is ARM-only, and `network_scan()` lost its nested functions.
+
 ## v1.1.0 (2026-09-02) - release
 
 ### Xpad: the whole controller, not just four directions and fire

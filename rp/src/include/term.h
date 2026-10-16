@@ -32,7 +32,7 @@
 
 #ifdef DISPLAY_ATARIST
 // Terminal size for Atari ST
-#define TERM_SCREEN_SIZE_X 40
+#define TERM_SCREEN_SIZE_X 80  // 640 pixels of 8x8 characters
 #define TERM_SCREEN_SIZE_Y 24  // Leave last line for status
 #define TERM_SCREEN_SIZE (TERM_SCREEN_SIZE_X * TERM_SCREEN_SIZE_Y)
 

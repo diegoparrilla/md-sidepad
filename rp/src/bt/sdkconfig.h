@@ -12,12 +12,13 @@
 #ifndef SIDEPAD_SDKCONFIG_H
 #define SIDEPAD_SDKCONFIG_H
 
-// Sidepad injects a single joystick, so only one controller is ever paired at a
-// time. Capping Bluepad32 at one device enforces that: a new controller can
-// only pair after the current one is disconnected (see controller_requestPairing
-// in controller.c), and a stray second controller can never co-drive joystick 1.
-#define CONFIG_BLUEPAD32_MAX_DEVICES 1
-#define CONFIG_BLUEPAD32_MAX_ALLOWLIST 1
+// Up to four controllers at once, one per Xpad pad slot. A controller's slot is
+// its Bluepad32 device index: the first free one when it connects, kept for as
+// long as it stays connected. Only slot 0 is injected as joystick 1 and the
+// mouse, so a second controller can never co-drive them; slots 1-3 reach games
+// through Xpad alone. Must equal CONTROLLER_MAX_PADS (asserted in controller.c).
+#define CONFIG_BLUEPAD32_MAX_DEVICES 4
+#define CONFIG_BLUEPAD32_MAX_ALLOWLIST 4
 #define CONFIG_BLUEPAD32_GAP_SECURITY 1
 #define CONFIG_BLUEPAD32_ENABLE_BLE_BY_DEFAULT 1
 

@@ -1,0 +1,21 @@
+# The controllers emu/test.sh plays through EmuMD's Bluetooth stand-in:
+#   <ms> <slot> connect [name]
+#   <ms> <slot> state buttons= misc= dpad= lx= ly= rx= ry= lt= rt=
+#   <ms> <slot> disconnect
+# Times are emulated milliseconds from Bluetooth coming up; values are
+# Bluepad32's own (buttons=0x1 is A, the bottom face button). See EmuMD's
+# docs/GUIDE.md, "Bluetooth controllers".
+
+# Player 1 connects at the terminal, which starts the auto-exit
+# countdown: nothing needs a key pressed to reach the desktop.
+1000 0 connect Xbox Wireless Controller
+
+# A second pad, holding A from the start. Only player 1's input cancels
+# the countdown, so this cannot keep the ST in the terminal, and it is
+# there, held, whenever XPADTEST gets to look.
+3000 1 connect DualSense Wireless Controller
+3500 1 state buttons=0x1
+
+# Long after XPADTEST has asked for rumble, the second pad goes, and
+# XPADTEST waits to see its slot empty.
+40000 1 disconnect

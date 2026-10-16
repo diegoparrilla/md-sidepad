@@ -43,16 +43,25 @@
 #define XPADSTATE_ST_BLOCK (XPADSTATE_ROM4_BASE + XPADSTATE_BLOCK_OFFSET)
 #define XPADSTATE_ST_PROVIDER (XPADSTATE_ROM4_BASE + XPADSTATE_PROVIDER_OFFSET)
 
-/* One pad for now: Sidepad pairs a single controller. The block reserves
- * room for XPAD_MAX_PADS so raising this needs no address to move. */
-#define XPADSTATE_PAD_COUNT 1
+/* One slot per controller, all published on every commit. A slot whose
+ * controller is not connected reads XPAD_TYPE_NONE. pad_count is fixed
+ * for the life of a block, so the empty slots are there from the start
+ * rather than appearing as pads connect. */
+#define XPADSTATE_PAD_COUNT 4
 
 /* Write the parts of the block that never change, and an empty pad.
  * Call once, before the first xpadstate_publish(). */
 void xpadstate_init(void);
 
-/* Sample the controller and publish it. Cheap enough to call at the
+/* Sample every controller and publish them. Cheap enough to call at the
  * joystick poll rate. */
 void xpadstate_publish(void);
+
+/* Point the block's req at the XPAD_REQ area the ST has set aside in its
+ * own RAM, and claim rumble now that there is somewhere to ask for it.
+ * The cartridge window is read-only to the ST, so the request area cannot
+ * live in the block; userfw.s sends its address (APP_XPAD_REQ_ADDR) and
+ * waits to see it here before it installs the cookie. */
+void xpadstate_setReq(uint32_t m68kAddr);
 
 #endif  // XPADSTATE_H

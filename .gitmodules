@@ -13,3 +13,6 @@
 [submodule "xpad"]
 	path = xpad
 	url = https://github.com/neilrackett/atarist-xpad.git
+[submodule "emu/emumd"]
+	path = emu/emumd
+	url = https://github.com/neilrackett/emumd.git

@@ -383,7 +383,7 @@ This module is responsible for handling the blinking of the LED on the Raspberry
 
 This module is responsible for handling the external display. It uses the `u8g2` library to control the display and implement the functionality. 
 
-In this version it wraps the `u8g2` library to provide a simple interface to draw text, scroll up texts and draw images on the display. Since it is focused in the first version for Atari ST computers, it creates a 320x200 monochrome display with a 8x8 font, indpendently of the real display used: Low res or High res. We can think this as a frame buffer that will be used to draw the text and images. The code in the `/target` folder will be responsible for reading this frame buffer and sending the data to the Atari ST computer memory screen.
+In this version it wraps the `u8g2` library to provide a simple interface to draw text, scroll up texts and draw images on the display. Since it is focused in the first version for Atari ST computers, it creates a 640x200 monochrome display with a 8x8 font, 80 columns by 25 rows, independently of the real display used: the cartridge shows it in medium res on a colour monitor and line-doubles it in high res on a mono one. We can think this as a frame buffer that will be used to draw the text and images. The code in the `/target` folder will be responsible for reading this frame buffer and sending the data to the Atari ST computer memory screen.
 
 The `display.c` should be wrapped by a more high level display manager that will be responsible for handling no only the text but also the keyboard input and the mouse input, if necessary. In the template app this is in the `display_term.c` file.
 
@@ -724,13 +724,13 @@ The 64 KB `ROM_IN_RAM` region is mirrored 1:1 into the Atari ST address space at
 | `$FA2008` | `0x20032008` | 4 B        | **RANDOM_TOKEN_SEED**                     |
 | `$FA200C` | `0x2003200C` | 4 B        | reserved for framework use (zeroed by `chandler_init`) |
 | `$FA2010` | `0x20032010` | 240 B      | **SHARED_VARIABLES** — 60 indexed 4-byte slots |
-| `$FA2100` | `0x20032100` | 512 B      | **TRANSTABLE** — high-res mask table written by `display_setupU8g2()` |
-| `$FA2300` | `0x20032300` | ~48 KB     | **APP_FREE** — free arena for app-specific buffers |
-| `$FAE0C0` | `0x2003E0C0` | 8000 B     | **FRAMEBUFFER** (320×200 monochrome)      |
+| `$FA2100` | `0x20032100` | 512 B      | reserved (was the high-res mask table; nothing writes it now) |
+| `$FA2300` | `0x20032300` | ~40 KB     | **APP_FREE** — free arena for app-specific buffers |
+| `$FAC180` | `0x2003C180` | 16000 B    | **FRAMEBUFFER** (640×200 monochrome)      |
 | `$FAFFFF` | `0x2003FFFF` | —          | end of region                             |
 
 Why the framebuffer sits at the top:
-- Apps get a single contiguous 48 KB arena (`APP_FREE`) instead of the previous fragmented "above the framebuffer / below the tokens" hole.
+- Apps get a single contiguous arena, about 40 KB, (`APP_FREE`) instead of the previous fragmented "above the framebuffer / below the tokens" hole.
 - A framebuffer overrun walks off the end of the 64 KB region into unused RP RAM rather than corrupting the random-token slot or the shared-variables block.
 
 Cartridge code budget:
@@ -752,14 +752,14 @@ hard-code the literal address.
 | Reserved (zeroed by `chandler_init`)        | `CHANDLER_RESERVED_OFFSET`            | `RESERVED_SLOT_ADDR`         | `$FA200C`  |
 | Shared variables base (60 × 4 B slots)      | `CHANDLER_SHARED_VARIABLES_OFFSET`    | `SHARED_VARIABLES`           | `$FA2010`  |
 | Shared-variables slot count                 | `CHANDLER_SHARED_VARIABLES_SLOTS`     | (implicit: 60)               | 60         |
-| App buffers base (TRANSTABLE + APP_FREE)    | `CHANDLER_APP_BUFFERS_OFFSET`         | `APP_BUFFERS_ADDR`           | `$FA2100`  |
-| High-res mask table base                    | `CHANDLER_HIGHRES_TRANSTABLE_OFFSET`  | `TRANSTABLE`                 | `$FA2100`  |
-| High-res mask table size                    | `CHANDLER_HIGHRES_TRANSTABLE_SIZE`    | `TRANSTABLE_SIZE`            | 512 B      |
+| App buffers base (reserved + APP_FREE)      | `CHANDLER_APP_BUFFERS_OFFSET`         | `APP_BUFFERS_ADDR`           | `$FA2100`  |
+| Reserved (was the high-res mask table)      | `CHANDLER_HIGHRES_TRANSTABLE_OFFSET`  | —                            | `$FA2100`  |
+| Reserved size                               | `CHANDLER_HIGHRES_TRANSTABLE_SIZE`    | —                            | 512 B      |
 | Free arena for app-specific buffers         | `CHANDLER_APP_FREE_OFFSET`            | `APP_FREE_ADDR`              | `$FA2300`  |
-| Framebuffer base                            | `CHANDLER_FRAMEBUFFER_OFFSET`         | `FRAMEBUFFER_ADDR`           | `$FAE0C0`  |
-| Framebuffer size                            | `CHANDLER_FRAMEBUFFER_SIZE`           | `FRAMEBUFFER_SIZE`           | 8000 B     |
+| Framebuffer base                            | `CHANDLER_FRAMEBUFFER_OFFSET`         | `FRAMEBUFFER_ADDR`           | `$FAC180`  |
+| Framebuffer size                            | `CHANDLER_FRAMEBUFFER_SIZE`           | `FRAMEBUFFER_SIZE`           | 16000 B    |
 
-Apps that use the high-res rendering path must skip past `CHANDLER_HIGHRES_TRANSTABLE_SIZE` (512 B) of `APP_BUFFERS` before laying down their own data — `display_setupU8g2()` writes the mask table at `APP_BUFFERS_OFFSET..APP_BUFFERS_OFFSET+0x200`. Apps that don't use the high-res path can reclaim those 512 bytes.
+The 512 bytes at the start of `APP_BUFFERS` held the mask table the cartridge used to double a 320-pixel framebuffer's pixels in high res. The framebuffer is 640 wide now, so high res only doubles lines and nothing writes them; they stay reserved so that `APP_FREE`, and MD/Sidepad's Xpad block at its start, do not move.
 
 #### The remote computer codebase
 

@@ -57,7 +57,11 @@
 #define MAX_NR_HID_HOST_CONNECTIONS 4
 #define MAX_NR_HIDS_CLIENTS 4
 #define MAX_NR_HFP_CONNECTIONS 1
-#define MAX_NR_L2CAP_CHANNELS 6
+// Four controllers (CONFIG_BLUEPAD32_MAX_DEVICES). A Classic HID pad holds two
+// channels, control and interrupt, so four of them need eight, plus one for
+// the SDP query a new pad gets and a spare. Bluepad32's own example has 6,
+// which only fits three Classic pads.
+#define MAX_NR_L2CAP_CHANNELS 10
 #define MAX_NR_L2CAP_SERVICES 5
 #define MAX_NR_RFCOMM_CHANNELS 1
 #define MAX_NR_RFCOMM_MULTIPLEXERS 1

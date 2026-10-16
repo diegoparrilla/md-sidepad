@@ -28,6 +28,9 @@ debug:
 examples:
 	cd examples && stcmd make
 
+## make emu: run it in Hatari on this computer (emu/emu.mk)
+include emu/emu.mk
+
 ## Tag this version
 .PHONY: tag
 tag:

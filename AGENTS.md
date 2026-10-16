@@ -8,7 +8,7 @@ See also: `programming.md` (full shared-region table and budget rules), `README.
 
 Template-derived **Sidecartridge Multi-device microfirmware app** targeting Atari ST / STE / MegaST(E). Each "app" is a UF2 image that runs on a Raspberry Pi Pico (RP2040) plugged into the Multi-device cartridge slot, emulating a ROM cartridge for the Atari while also handling networking, SD card I/O, and config. Public build/usage docs: <https://docs.sidecartridge.com/sidecartridge-multidevice/programming/>.
 
-**MD/Sidepad** pairs a Bluetooth gamepad with the Atari ST and injects it as **joystick 1** (optionally right-stick-as-mouse). The BLE host is Bluepad32 on the Pico W's CYW43 chip; WiFi is stripped because it shares that chip. UUID `7795c766-c5a8-4607-bc7d-01c55e03d300`; **`pico_w`-only** (CYW43 required for BLE).
+**MD/Sidepad** pairs up to four Bluetooth gamepads with the Atari ST, injects the first as **joystick 1** (optionally right-stick-as-mouse) and publishes all four, with rumble, as an Xpad block. The BLE host is Bluepad32 on the Pico W's CYW43 chip; WiFi is stripped because it shares that chip. UUID `7795c766-c5a8-4607-bc7d-01c55e03d300`; **`pico_w`-only** (CYW43 required for BLE).
 
 ## Environment setup
 
@@ -40,7 +40,7 @@ Build flow (orchestrated by `build.sh`):
 3. Builds the RP firmware (`rp/build.sh`): pins submodule versions (pico-sdk 2.2.0, pico-extras sdk-2.2.0, fatfs-sdk at a specific commit), runs CMake, produces `rp/dist/rp-<board>.uf2`. FatFs config lives at `rp/src/ff/ffconf.h` and shadows the submodule's default via `target_include_directories(... BEFORE PRIVATE)` in `rp/src/CMakeLists.txt`, so the `fatfs-sdk` submodule stays pristine.
 4. Computes MD5, renames to `dist/<APP_UUID>-<VERSION>.uf2`, and substitutes UUID/MD5/version into `dist/<APP_UUID>.json` from the `desc/app.json` template.
 
-Successful builds drop UF2s into `dist/` and print the MD5 used in the generated JSON manifest. Verification = `make -C rp/test test` passes (the Xpad block writer's host test, also run by CI), the build succeeds, the UF2 boots on hardware, and behaviour is confirmed over the serial console.
+Successful builds drop UF2s into `dist/` and print the MD5 used in the generated JSON manifest. Verification = `make -C rp/test test` passes (the Xpad block writer's and the rumble decisions' host tests, also run by CI), the build succeeds, the UF2 boots on hardware, and behaviour is confirmed over the serial console.
 
 ### Build gotchas
 - **CMake always builds with `-DCMAKE_BUILD_TYPE=MinSizeRel`** regardless of `<build_type>`. A full `Release` previously caused breakage (memory/over-optimization); the legacy line is left commented in `rp/build.sh`. `<build_type>` only controls the `DEBUG_MODE` macro and the dist filename.
@@ -76,8 +76,8 @@ The Atari sees a 64 KB window `$FA0000`–`$FAFFFF`, mirrored RP-side at **`0x20
 | `$FA0000` | cartridge image | 8 KB | m68k header + all `.text_*` sections (hard limit) |
 | `$FA2000` | `CMD_MAGIC_SENTINEL` | 4 B | m68k polls here for NOP/RESET/BOOT_GEM/START/TERMINAL words |
 | `$FA2010` | 60 × 4 B indexed shared variables (`SHARED_VARIABLES`) | 240 B | after `RANDOM_TOKEN`/`SEED`/reserved at `$FA2004`–`$FA200F` |
-| `$FA2100` | `APP_BUFFERS` / `APP_FREE` | ~48 KB | app arena (first 512 B are the high-res mask table) |
-| `$FAE0C0` | `FRAMEBUFFER` | 8000 B | 320×200 mono; at the top so an overrun walks off the 64 KB end |
+| `$FA2100` | `APP_BUFFERS` / `APP_FREE` | ~40 KB | app arena (first 512 B reserved, once the high-res mask table) |
+| `$FAC180` | `FRAMEBUFFER` | 16000 B | 640×200 mono; at the top so an overrun walks off the 64 KB end |
 
 See `programming.md` for the full table and budget rules.
 
@@ -125,7 +125,9 @@ Two things it is worth knowing before changing anything here.
 
 `xpadstate.c` carries `_Static_assert`s tying its own offsets to the
 header, so a bump that moves a field fails the build rather than
-producing a block nobody agrees with. Keep them.
+producing a block nobody agrees with. Keep them. Two of them guard
+`userfw.s` too: `OFF_REQ == 22` (its `XPAD_REQ_PTR_ADDR`) and the
+`XPAD_REQ` layout (its hand-laid `res_req`).
 
 `target/atarist/src/userfw.s` includes xpad's generated `xpad.inc`
 directly. That works because `target/atarist/build.sh` mounts the
@@ -135,21 +137,49 @@ refuses with a clear message if the submodule is missing. The one Xpad
 number still spelled out by hand is `XPAD_BLOCK equ $FA2300`, the
 block's home in the cartridge window, which is this product's choice
 rather than xpad's and is pinned on the RP side by a `_Static_assert`
-against `CHANDLER_APP_FREE_OFFSET`.
+against `CHANDLER_APP_FREE_OFFSET`. `XPAD_REQ_PTR_ADDR` is derived from
+it and `XPAD_HDR_FIXED`, because `xpad.inc` deliberately stops before
+the pointer fields.
 
 ## MD/Sidepad specifics
 
 The pieces below are hard-won and non-obvious — read before touching the command path, joystick injection, or the booster/desktop exits.
 
 ### Keymap (single-key, `sidepadInputCb`)
-`ESC` = exit to GEM desktop (installs the joystick hook on the way out), `P` = pair, `M` = toggle right-stick-as-mouse, `J` = toggle joystick injection, `X` = toggle Xpad (block + cookie), **`H` = toggle VBL (`$70`) / ETV (`$400`) hook mode**, `B` = exit to Booster (full chip reset). The dedicated ST **Help** key toggles a help screen; it carries no useful ASCII, so `sidepadInputCb` dispatches it from the scan code (`SCAN_HELP = 0x62`) in bits 16–23 of the keystroke payload (`TERM_KEYBOARD_SCAN_MASK`). The template terminal is **line-based** (`term_command_cb` buffers until Enter), so MD/Sidepad registers its **own** `chandler_addCB(sidepadInputCb)` to act on the first keypress. `APP_TERMINAL_START` = ESC, `APP_TERMINAL_KEYSTROKE` = any other key. `H`/`M`/`J`/`X` persist via per-app config (`ACONFIG_PARAM_HOOK` / `ACONFIG_PARAM_MOUSE` / `ACONFIG_PARAM_JOYSTICK` / `ACONFIG_PARAM_XPAD`; joystick and Xpad default on when the key is absent), saved in `exitToGemDesktop`.
+`ESC` = exit to GEM desktop (installs the joystick hook on the way out), `R` = reset: disconnect every pad and forget every bond (new pads can pair at any time without it; it was `P` for Pair before pairing became always open), `M` = toggle right-stick-as-mouse, `J` = toggle joystick injection, `X` = toggle Xpad (block + cookie), **`H` = toggle VBL (`$70`) / ETV (`$400`) hook mode**, `B` = exit to Booster (full chip reset). The dedicated ST **Help** key toggles a help screen; it carries no useful ASCII, so `sidepadInputCb` dispatches it from the scan code (`SCAN_HELP = 0x62`) in bits 16–23 of the keystroke payload (`TERM_KEYBOARD_SCAN_MASK`). The template terminal is **line-based** (`term_command_cb` buffers until Enter), so MD/Sidepad registers its **own** `chandler_addCB(sidepadInputCb)` to act on the first keypress. `APP_TERMINAL_START` = ESC, `APP_TERMINAL_KEYSTROKE` = any other key. `H`/`M`/`J`/`X` persist via per-app config (`ACONFIG_PARAM_HOOK` / `ACONFIG_PARAM_MOUSE` / `ACONFIG_PARAM_JOYSTICK` / `ACONFIG_PARAM_XPAD`; joystick and Xpad default on when the key is absent), saved in `exitToGemDesktop`.
 
 ### Joystick injection (`target/atarist/src/userfw.s`)
 - Hook the **VBL autovector `$70`**, *not* a `_vblqueue` slot — GEM reclaims free `_vblqueue` slots when the desktop loads, silently de-linking the hook. `$70` is the OS VBL entry; GEM only adds/removes `_vblqueue` entries (which the `$70` handler walks), so a hook there survives into the desktop. Chain to the saved original.
-- **VBL vs ETV (selectable, implemented and hardware-verified):** two resident entry points share one `do_inject` routine and the same `push orig_hook; rts` chain (valid for the `$70` autovector — orig rte's the interrupt frame — **and** the `$400` etv_timer subroutine — orig rts's back to TOS' MFP ISR which rte's; confirmed against `md-devops` runner.s). The installer reads the hook-mode flag from shared-var **slot 6** (`HOOK_FLAG_ADDR = $FA202B`) and hooks `$70` or `resident_etv_start` at `$400`. etv_timer fires ~200 Hz, so the ETV entry rate-limits (`ETV_DIVISOR = 4` → ~50 Hz) to match VBL. **Default = ETV** (`ACONFIG_PARAM_HOOK` default `"true"`); `[H]` switches to VBL. ETV survives programs that replace the VBL vector, so it's the more compatible default (esp. games).
-- The cartridge region is emulated **read-only**: fetches/reads work, **stores bus-error**. The resident handler keeps writable state (prev sample, packet buffer, saved joyvec, orig hook, `etv_div`) in RAM — the installer `Malloc`s a block (`GEMDOS_Malloc` 72) and copies a position-independent handler in. Reads of the shared region still work, so it reads the controller byte in place.
+- **VBL vs ETV (selectable, implemented and hardware-verified):** two resident entry points share one `do_inject` routine and the same `push orig_hook; rts` chain (valid for the `$70` autovector — orig rte's the interrupt frame — **and** the `$400` etv_timer subroutine — orig rts's back to TOS' MFP ISR which rte's; confirmed against `md-devops` runner.s). The installer reads the hook-mode flag from shared-var **slot 6** (`HOOK_FLAG_ADDR = $FA202B`) and hooks `$70` or `resident_etv_start` at `$400`. `etv_timer` is called at **50 Hz** (every fourth tick of the 200 Hz Timer C, not every tick), the same as a PAL VBL, so the ETV entry injects on every call. It used to divide by four again, on the belief that `etv_timer` ran at 200 Hz, which left ETV mode, the default, injecting at 12.5 Hz; measured under TOS 1.62, TOS 2.06 and EmuTOS in Hatari, it is 50 Hz. Don't reintroduce a divider. **Default = ETV** (`ACONFIG_PARAM_HOOK` default `"true"`); `[H]` switches to VBL. ETV survives programs that replace the VBL vector, so it's the more compatible default (esp. games).
+- The cartridge region is emulated **read-only**: fetches/reads work, **stores bus-error**. The resident handler keeps writable state (prev sample, packet buffer, saved joyvec, orig hook, rumble state) in RAM — the installer `Malloc`s a block (`GEMDOS_Malloc` 72) and copies a position-independent handler in. Reads of the shared region still work, so it reads the controller byte in place.
 - Read **joyvec live each frame** from KBDVECS (`XBIOS Kbdvbase` 34, joyvec at **offset 24** — not 20). A reader typically installs its own joyvec *after* us; a snapshot would bypass it. Same live-read for mousevec (offset 16).
 - Synthesise a TOS joystick packet `[$FF, joy0, joy1]` with the `$FF` header at an **odd** address (consumers read `move.w 1(a0)`). Our state → **joy1**. IKBD encoding: bit0=Up, bit1=Down, bit2=Left, bit3=Right, **bit7=Fire**. The RP packs fire into bit6; userfw moves it to bit7.
+
+### The terminal is 640x200 (`display.c`, `term.h`, `main.s`, `emul.c`)
+- The framebuffer is 640×200, one bit a pixel, 80 columns of 8×8 text. `main.s` shows it in **medium resolution** on a colour monitor and **high resolution** on a mono one. Medium writes each framebuffer word to both planes (colour 3). High res writes each row twice, and needs no pixel doubling, so the high-res mask table is gone.
+- Switching to medium changes TOS's state, so `main.s` saves the resolution and palette colour 3 in its relocated RAM copy (`saved_rez`, `saved_color3`). It sets colour 3 to colour 15's value (low res's foreground). `boot_gem` puts both back before the banner and GEM. `saved_rez` stays -1 on mono, or after a warm reset that skips the terminal, and nothing is restored then.
+- A medium-res cell is twice as tall as it is wide, so the visualiser is drawn twice as many cells wide as tall to stay square: an 18×9 box with a 6×3 blob. Anything new in that area should follow suit.
+- The full copy is 8000 words through a `rol.w #8` byte swap. That is about 64 ms on an 8 MHz ST, so the terminal redraws at about 15 Hz, which is faster than the RP's 100 ms UI refresh.
+- `renderControllerScreen`'s buffers (`currentLines`, `updates`, 4 KB) are **static**: at 80 columns they are about 6 KB, too much for core 0's 4 KB stack. That is safe because a refresh never runs inside another.
+- `main.s` uses about 1806 of its 2048 bytes.
+- `make emu` shows colour; add `-- --monitor mono` to `mdfw run` for mono.
+
+### Multiple pads (`controller.c`, `xpadstate.c`)
+- A pad's **slot is its Bluepad32 device index**: the first free one when it connects, kept while it stays connected. `CONFIG_BLUEPAD32_MAX_DEVICES` (`rp/src/bt/sdkconfig.h`), `CONTROLLER_MAX_PADS` and `XPADSTATE_PAD_COUNT` are all 4 and asserted equal. **Slot 0 alone** is joystick 1 and the mouse (`controller_getState()` is slot 0, so the injection, banner, auto-exit and visualiser code reads only it); every slot is an Xpad pad, and `xpadstate_publish()` writes all four every commit so no slot is ever two commits old. `pad_count` is immutable for a published block, so empty slots are there from the start as `XPAD_TYPE_NONE`.
+- Pairing is always open: Bluepad32 scans from `on_init_complete` and never stops, so a pad in pairing mode joins whenever a slot is free, desktop included. `R` (Reset) disconnects every slot and deletes all keys.
+- On ready, a pad's player LEDs are set to `1 << slot` where the driver has them.
+- `MAX_NR_L2CAP_CHANNELS` is 10, not the 6 Bluepad32's example ships: a Classic HID pad holds two channels, so 6 only fits three Classic pads.
+- **RAM:** `g_devices` is ~23 KB for four devices. `.bss` now ends at `0x20027574`, ~35 KB below `ROM_IN_RAM` (was ~53 KB). The heap may legally grow into the cartridge mirror (see the `__StackLimit` caveat), so watch heap use.
+- **Unverified risk:** BTstack's link-key TLV defaults to `PICO_FLASH_BANK_STORAGE_OFFSET` = the last 8 KB of flash (`0x101FE000`), which is exactly `GLOBAL_LOOKUP_FLASH` + `GLOBAL_CONFIG_FLASH` in `memmap_rp.ld`. Nothing overrides it. More bonds mean more writes there. After pairing four pads, power-cycle and check the app still boots; if not, the likely fix is a `PICO_FLASH_BANK_STORAGE_OFFSET` in an unused region, but decide that deliberately.
+
+### Rumble (`userfw.s`, `rumble.h`/`rumble.c`, `emul.c`)
+- The block is in the read-only window, so the **`XPAD_REQ` area is `res_req` in the resident's Malloc'd RAM block**, and only the RP can point the block's `req` at it. The installer (if the Xpad flag is set) sends `APP_XPAD_REQ_ADDR` with the address and polls `XPAD_REQ_PTR_ADDR` (`$FA2316`) until the RP has written it back, resending every 8 frames, giving up after ~50 frames (each frame's `_frclock` wait is spin-capped so boot can never hang). Only then does it install the cookie, then the hook. On a timeout rumble stays off for the session (`RQ_ON` clear). Malloc failure: cookie only, `req` NULL. A warm reset re-Mallocs and handshakes again.
+- `xpadstate_setReq()` writes `req`, then claims `XPAD_CAP_RUMBLE`. Rumble is claimed whenever there is a request area, not only while a pad with motors is connected: consumers read caps once, pads hot-plug, and a pad without motors ignores it.
+- **ROM3 commands from the resident**, ids clear of the terminal's 0/1, defined in both `emul.c` and `userfw.s`: `APP_XPAD_REQ_ADDR $5850` (payload after the zero token: address low word, high word) and `APP_XPAD_RUMBLE $5851` (four words, `rumble[i][0] << 8 | rumble[i][1]`, i.e. the big-endian words at `req+4`). Same framing and checksum as `send_sync` (`$ABCD`, cmd, size incl. token, words, cmd+size+Σwords), but sent by `res_send` in the resident, fire and forget: it runs in an interrupt, and nothing waits on the token echo. Nothing else issues ROM3 reads after `boot_gem`, so there is nothing to interleave with.
+- **State, never events:** chandler holds one pending command and drops a *different* one that arrives meanwhile, so every rumble frame carries all four pads. `do_rumble` sends when `req.seq` moves, at most every 30 ms (`RQ_MIN_GAP`, so two different frames cannot share one 20 ms RP drain), every 200 ms (`RQ_KEEPALIVE`) while any motor is on, and once more after they all go off. Nothing at all until a consumer first bumps `seq`. Both are timed on `_hz_200`, never in hook ticks: the hook's rate depends on VBL/ETV mode and the display, and the RP's timeout is real time. Counting ticks is how the first version tripped its own safety stop under ETV (see below).
+- **Safety stop:** the RP re-arms a held level as a 250 ms burst every 200 ms, but only while frames keep arriving: a pad with no frame for 600 ms is stopped once (`rumble_logic_tick`). That is what stops a motor when the ST resets or a game unhooks `$70`/`$400`. COMpad lacked it. `APP_XPAD_REQ_ADDR` also stops everything (a new session), and a disconnect forgets the slot's levels.
+- **Both burst loops in `exitToGemDesktop()` call `chandler_loop()`**, because the installer's handshake runs inside the `CMD_START` burst. Don't remove them.
+- The decisions are SDK-free in `rumble.h` and host tested by `rp/test/rumble_test.c`.
 
 ### RP→m68k handoff (`emul.c` exit path + `main.s`)
 - **Inject only on exit-to-desktop, never during the terminal loop.** Installing the hook while the terminal is live races the VBL handler's cartridge-bus reads against the terminal's `send_sync` protocol and corrupts keystroke delivery.
@@ -170,6 +200,17 @@ Publishing the hook-mode flag via a `static void writeHookMode()` **helper funct
 ### Other gotchas
 - Bluepad32's CMake defaults to `pico_cyw43_arch_none`; `rp/src/CMakeLists.txt` patches it at configure time to `pico_cyw43_arch_lwip_poll` so it coexists with lwIP without modifying the submodule.
 - Once a controller connects, the terminal counts down `SIDEPAD_AUTOEXIT_SECONDS` (10) then exits to the desktop as if ESC was pressed (any key/controller input cancels, stickily).
+
+### EmuMD (`mdfw.ini`, `emu/`)
+`make emu` runs the real firmware in Hatari through [EmuMD](https://github.com/neilrackett/emumd) (submodule `emu/emumd`; `EMUMD=../emumd` for a checkout); `make emu-test` (`emu/test.sh`) is the end-to-end test of everything above: four slots, a second pad, rumble out and back, the safety stop not cutting in while held. EmuMD stands in for the template's hardware and, with `[bluetooth]`, for Bluepad32: controllers come from a script (`-O pads=FILE`, format in `emu/test/pads.txt`), and every rumble and LED call is logged as `Bluepad32: pad N ...`. Things that are easy to break:
+- **No harddrive.** A GEMDOS drive takes the cartridge's first 1 KB, where `main.s` boots. ST programs go on a floppy (`emu/test.sh` builds one with mtools); `XPADTEST.PRG` runs from its `AUTO` folder once the auto-exit has left the terminal.
+- **No `-V` in the test.** DPRINTF output lands in the middle of the ST's console lines. Everything the test checks is logged without it; use `-V` by hand to see `Xpad: req at` and `Rumble:` lines.
+- **One `-O` only**: several break on an EmuMD/Hatari option-joining bug.
+- **Host builds need host-safe code:** cartridge-window addresses are `uintptr_t`, not `uint32_t` (`chandler.c`, `display.c`, `emul.c`): the same width on the RP2040, whole on a 64-bit host. `tprotocol.h`'s `strh` is behind `__arm__`. `network_scan()` has no nested functions. `u8g2_d_setup.c` is left out of the host build (it names drivers this u8g2 lacks; the device's linker drops it). Offsets computed as `(uint32_t)&sym - XIP_BASE` are fine: they wrap back to the right value.
+- `controller_init()`'s `initialized` guard survives an EmuMD reboot (statics persist there), so a reboot that is not to the Booster would leave Bluetooth down in the emulator. Real hardware resets the chip, so this is emulator-only.
+
+### Mouse speed is per injection
+`SIDEPAD_MOUSE_MAX_SPEED` is pixels per injection at full deflection, so the cursor's real speed is that times the hook's rate: 50 Hz on ETV, the display's rate on VBL (50, 60 or 71 Hz). It was tuned to 20 while ETV wrongly injected at 12.5 Hz (see above), so it is now 5, the same 250 pixels a second. Fractions of a pixel are carried from frame to frame (`mouseAxisDelta`), because at 50 Hz whole pixels alone would make the slowest speed 50 pixels a second. Retune on hardware if it feels wrong; anything timed in real seconds should use `_hz_200`, as rumble does.
 
 ### Known limitation (by design)
 Injection rides the IKBD `joyvec` path. Games/demos that read the joystick straight from the IKBD ACIA interrupt (e.g. the Blood Money demo) bypass `joyvec` entirely and **will not see the pad**; tools that go through `joyvec` (PP's JOYMOUT, most games — Duke Nukem works in ETV mode) do. Separately, joystick-1 fire is physically wired to the **right mouse button** at the IKBD, so synthesised fire also shows as a right-click — expected ST hardware behaviour.
