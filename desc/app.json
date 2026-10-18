@@ -1,7 +1,7 @@
 {
   "uuid": "<APP_UUID>",
   "name": "MD/Sidepad",
-  "description": "MD/Sidepad enables you to connect up to four Bluetooth gamepads to your Atari ST. The first works as a joystick and mouse, and games that support Xpad can use all four, with every button, both analogue sticks, the triggers and rumble.  For more information and games, visit <a href=\"https://neilrackett.com/atarist\">neilrackett.com</a>.",
+  "description": "MD/Sidepad enables you to connect up to four Bluetooth gamepads to your Atari ST. The first works as a joystick and mouse, and games that support Xpad can use all four, with every button, both analogue sticks, the triggers and rumble. For more information and games, visit <a href=\"https://neilrackett.com/atarist\">neilrackett.com</a>.",
   "image": "https://downloads.neilrackett.com/md-sidepad/image.webp",
   "tags": [
     "Bluetooth",
