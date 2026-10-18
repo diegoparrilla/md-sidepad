@@ -1,5 +1,6 @@
-# Version from file
-VERSION := $(shell cat version.txt)
+# Version from the repository's version.txt, the one source of truth:
+# build.sh mounts the repository root, so it is two levels up from here.
+VERSION := $(shell cat ../../version.txt)
 VERSION_MAJOR := $(shell echo $(VERSION) | awk -F'.' '{print $$1}')
 VERSION_MINOR := $(shell echo $(VERSION) | awk -F'.' '{print $$2}')
 VERSION_PATCH := $(shell echo $(VERSION) | awk -F'.' '{print $$3}')
@@ -61,7 +62,12 @@ prepare: clean
 
 clean-compile : clean main.o userfw.o
 
+# Generate the credit banner (banner_txt) boot_gem prints, with the version
+# substituted, as MD/Net and MD/DOOM do. Written here rather than through
+# vasm -D string macros, which vasm will not concatenate inside a dc.b, so
+# the banner always matches the build version.
 main.o: prepare
+	printf 'banner_txt:\tdc.b "MD/Sidepad $(VERSION) (c)2026 Neil Rackett",13,10\n\tdc.b "GPLv3 neilrackett.com/atarist",13,10,0\n\teven\n' > $(SOURCES_DIR)/version.inc
 	$(VASM) $(VASMFLAGS) $(SOURCES_DIR)/main.s -o $(BUILD_DIR)/main.o
 
 userfw.o: prepare

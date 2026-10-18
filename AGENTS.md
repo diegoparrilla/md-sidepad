@@ -161,7 +161,7 @@ The pieces below are hard-won and non-obvious — read before touching the comma
 - A medium-res cell is twice as tall as it is wide, so the visualiser is drawn twice as many cells wide as tall to stay square: an 18×9 box with a 6×3 blob. Anything new in that area should follow suit.
 - The full copy is 8000 words through a `rol.w #8` byte swap. That is about 64 ms on an 8 MHz ST, so the terminal redraws at about 15 Hz, which is faster than the RP's 100 ms UI refresh.
 - `renderControllerScreen`'s buffers (`currentLines`, `updates`, 4 KB) are **static**: at 80 columns they are about 6 KB, too much for core 0's 4 KB stack. That is safe because a refresh never runs inside another.
-- `main.s` uses about 1806 of its 2048 bytes.
+- `main.s` uses about 1894 of its 2048 bytes.
 - `make emu` shows colour; add `-- --monitor mono` to `mdfw run` for mono.
 
 ### Multiple pads (`controller.c`, `xpadstate.c`)

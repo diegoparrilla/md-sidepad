@@ -22,6 +22,13 @@ holds until the game changes it, and the motors stop by themselves
 about a second after the ST stops asking, so a reset mid-rumble cannot
 leave a pad buzzing.
 
+### A credit line on the way to the desktop
+
+Leaving the terminal for the desktop, with Esc or after a reset, now
+clears the screen and prints MD/Sidepad's version and credit line, as
+MD/Net and MD/DOOM do, with a blank line before the list of connected
+pads.
+
 ### An 80-column terminal
 
 The terminal is now 640x200, 80 columns: medium resolution on a colour

@@ -64,3 +64,5 @@ screenlog.*
 tmp/
 examples/*.tos
 uuid.txt
+# Generated boot banner (from version.txt at build time)
+target/atarist/src/version.inc
