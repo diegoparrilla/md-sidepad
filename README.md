@@ -102,7 +102,8 @@ You can run MD/Sidepad in [Hatari](https://www.hatari-emu.org) on your Mac or PC
 
 ## Known limitations
 
-- MD/Sidepad talks to your Atari ST through the system `joyvec`, so games and demos that read the IKBD ACIA interrupt directly, rather than going through `joyvec`, won't see your controller as a joystick. Software that reads Xpad is unaffected: there is no hook involved, so there is nothing to bypass.
+- MD/Sidepad talks to your Atari ST through the system `joyvec`, so games and demos that read the IKBD ACIA interrupt directly, rather than going through `joyvec`, won't see your controller as a joystick. Software that reads Xpad is unaffected, because it reads the pads from memory instead.
+- That memory is kept up to date by the same resident handler, on the VBL or, in ETV mode, the system timer. A game that takes over that interrupt without passing it on would see Xpad pads stop responding too; switching modes with `H` gets round it. Flashback, and anything else built on STDL, passes both on.
 - Rumble needs a controller Bluepad32 can drive the motors of: Xbox One/Series, DualShock 3 and 4, DualSense, Switch Pro and Joy-Cons, among others. 8BitDo and generic pads have none.
 - Development has focussed on Xbox One/Series gamepads, so if you have a different controller, please let us know how you get on.
 

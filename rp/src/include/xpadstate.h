@@ -26,7 +26,9 @@
 
 /*
  * The block sits at the start of APP_FREE, which nothing else uses.
- * userfw.s installs a cookie pointing at it, so XPAD_BLOCK there must
+ * userfw.s copies it into the resident's RAM every tick and points the
+ * cookie at the copy, so consumers never read the cartridge port; it
+ * reads the block from here as XPAD_BLOCK, which must
  * match XPADSTATE_ST_BLOCK below. All three sides spell the address out
  * rather than share a definition, because they are built by different
  * toolchains; xpadstate.c asserts this one against the framework's

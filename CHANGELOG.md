@@ -22,6 +22,16 @@ holds until the game changes it, and the motors stop by themselves
 about a second after the ST stops asking, so a reset mid-rumble cannot
 leave a pad buzzing.
 
+### Games read Xpad from memory
+
+Games used to read the Xpad block straight out of the cartridge window.
+On real hardware, Flashback froze whenever a cutscene was skipped with
+the pad, in older releases too, though never in an emulator and never
+with COMpad. The resident handler now keeps a copy of the block in ST
+RAM, brought up to date on every tick, and the cookie points at the
+copy, so games read memory, as they do from COMpad. Flashback no longer
+freezes.
+
 ### A credit line on the way to the desktop
 
 Leaving the terminal for the desktop, with Esc or after a reset, now

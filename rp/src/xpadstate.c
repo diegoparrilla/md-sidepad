@@ -144,6 +144,14 @@ _Static_assert(sizeof(XPAD_PAD) == XPAD_PAD_SIZE_V1, "XPAD_PAD is not v1");
 _Static_assert(HDR_SIZE <= XPADSTATE_BLOCK_SIZE,
                "the block does not fit in the space reserved for it");
 
+/* userfw.s copies this block into RAM by size, which is where consumers
+ * read it: XB_SIZE is the header and both buffers, XB_PADS_LEN one buffer
+ * of four pads, XB_NAME_LEN the provider name. */
+_Static_assert(HDR_SIZE == 122, "userfw.s XB_SIZE is 122");
+_Static_assert(XPADSTATE_PAD_COUNT * XPAD_PAD_SIZE_V1 == 48,
+               "userfw.s XB_PADS_LEN is four pads");
+_Static_assert(XPADSTATE_PROVIDER_SIZE == 32, "userfw.s XB_NAME_LEN is 32");
+
 /* A slot per controller, and no more slots than Xpad allows. */
 _Static_assert(XPADSTATE_PAD_COUNT == CONTROLLER_MAX_PADS,
                "one Xpad pad per controller slot");

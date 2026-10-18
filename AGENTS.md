@@ -139,7 +139,32 @@ block's home in the cartridge window, which is this product's choice
 rather than xpad's and is pinned on the RP side by a `_Static_assert`
 against `CHANDLER_APP_FREE_OFFSET`. `XPAD_REQ_PTR_ADDR` is derived from
 it and `XPAD_HDR_FIXED`, because `xpad.inc` deliberately stops before
-the pointer fields.
+the pointer fields, as are the `XB_` equates `userfw.s` copies the
+block by. `xpadstate.c` asserts their sizes (122 bytes, four pads, a
+32-byte name).
+
+### Xpad is read from RAM, never from the window
+The RP still publishes the block at `$FA2300`, but **the cookie points
+at `res_block`, a copy in the resident's RAM**. `mirror_block` makes it
+in the installer, after the handshake: the header, both buffers and the
+provider name (into `res_provider`), with `req` set to `res_req` and
+`XPAD_CAP_RUMBLE` set only if the handshake confirmed it (`RQ_ON`).
+`do_xpad`, on every hook tick, copies the RP's front buffer into the
+copy's back buffer whenever the RP's `seq` has moved, rechecks the RP's
+`seq` and `active`, then commits `seq` before `active`, as any provider
+must. A Malloc failure still publishes the window itself.
+- **Why:** with consumers reading the window directly, Flashback
+  (atarist-reminiscence r26, STDL) froze silently on hardware whenever a
+  cutscene was skipped with the pad. It happened with four pads and in an
+  older single-pad release, under VBL and ETV, at 8 MHz with no cache, and with `J` and
+  `M` off. Never in Hatari/EmuMD, never with COMpad (whose block is in
+  RAM), never when skipping with the keyboard. The mechanism was never
+  found; the RAM copy fixed it on hardware. **Don't point the cookie
+  back at the window** to save the copy.
+- **The trade-off:** Xpad now depends on the hook running, as the
+  joystick and mouse always did. A game that takes `$70` (VBL mode) or
+  Timer C (ETV mode) without chaining freezes the pads. STDL chains both.
+- The copy is 48 bytes, made at most once per RP commit (every 20 ms).
 
 ## MD/Sidepad specifics
 
@@ -174,7 +199,7 @@ The pieces below are hard-won and non-obvious — read before touching the comma
 - **Unverified risk:** BTstack's link-key TLV defaults to `PICO_FLASH_BANK_STORAGE_OFFSET` = the last 8 KB of flash (`0x101FE000`), which is exactly `GLOBAL_LOOKUP_FLASH` + `GLOBAL_CONFIG_FLASH` in `memmap_rp.ld`. Nothing overrides it. More bonds mean more writes there. After pairing four pads, power-cycle and check the app still boots; if not, the likely fix is a `PICO_FLASH_BANK_STORAGE_OFFSET` in an unused region, but decide that deliberately.
 
 ### Rumble (`userfw.s`, `rumble.h`/`rumble.c`, `emul.c`)
-- The block is in the read-only window, so the **`XPAD_REQ` area is `res_req` in the resident's Malloc'd RAM block**, and only the RP can point the block's `req` at it. The installer (if the Xpad flag is set) sends `APP_XPAD_REQ_ADDR` with the address and polls `XPAD_REQ_PTR_ADDR` (`$FA2316`) until the RP has written it back, resending every 8 frames, giving up after ~50 frames (each frame's `_frclock` wait is spin-capped so boot can never hang). Only then does it install the cookie, then the hook. On a timeout rumble stays off for the session (`RQ_ON` clear). Malloc failure: cookie only, `req` NULL. A warm reset re-Mallocs and handshakes again.
+- The **`XPAD_REQ` area is `res_req` in the resident's Malloc'd RAM block**. The installer (if the Xpad flag is set) sends `APP_XPAD_REQ_ADDR` with the address and polls `XPAD_REQ_PTR_ADDR` (`$FA2316`) until the RP has written it back, resending every 8 frames, giving up after ~50 frames (each frame's `_frclock` wait is spin-capped so boot can never hang). That proves the ROM3 path and starts a new rumble session on the RP. Then `mirror_block` copies the block into RAM (see above), the cookie goes in pointing at the copy, then the hook. On a timeout rumble stays off for the session (`RQ_ON` clear, and the copy has no `req` and no `XPAD_CAP_RUMBLE`). Malloc failure: the cookie points at the window, `req` NULL. A warm reset re-Mallocs and handshakes again.
 - `xpadstate_setReq()` writes `req`, then claims `XPAD_CAP_RUMBLE`. Rumble is claimed whenever there is a request area, not only while a pad with motors is connected: consumers read caps once, pads hot-plug, and a pad without motors ignores it.
 - **ROM3 commands from the resident**, ids clear of the terminal's 0/1, defined in both `emul.c` and `userfw.s`: `APP_XPAD_REQ_ADDR $5850` (payload after the zero token: address low word, high word) and `APP_XPAD_RUMBLE $5851` (four words, `rumble[i][0] << 8 | rumble[i][1]`, i.e. the big-endian words at `req+4`). Same framing and checksum as `send_sync` (`$ABCD`, cmd, size incl. token, words, cmd+size+Σwords), but sent by `res_send` in the resident, fire and forget: it runs in an interrupt, and nothing waits on the token echo. Nothing else issues ROM3 reads after `boot_gem`, so there is nothing to interleave with.
 - **State, never events:** chandler holds one pending command and drops a *different* one that arrives meanwhile, so every rumble frame carries all four pads. `do_rumble` sends when `req.seq` moves, at most every 30 ms (`RQ_MIN_GAP`, so two different frames cannot share one 20 ms RP drain), every 200 ms (`RQ_KEEPALIVE`) while any motor is on, and once more after they all go off. Nothing at all until a consumer first bumps `seq`. Both are timed on `_hz_200`, never in hook ticks: the hook's rate depends on VBL/ETV mode and the display, and the RP's timeout is real time. Counting ticks is how the first version tripped its own safety stop under ETV (see below).

@@ -105,21 +105,33 @@ HS_FRAMES           equ 50          ; frames to wait for the RP (~1 s)
 HS_RESEND           equ 8           ; resend the address every 8 frames (2^n)
 HS_SPIN             equ 4000        ; cap on one frame's wait, ~15 ms at 8 MHz
 
-; Xpad block, published by the RP into APP_FREE. Consumers find it through
-; the cookie jar and read it straight out of the window: no copy, no hook,
-; and nothing for a game to clobber. Must match XPADSTATE_ST_BLOCK in
-; rp/src/include/xpadstate.h.
+; Xpad block, published by the RP into APP_FREE. Must match
+; XPADSTATE_ST_BLOCK in rp/src/include/xpadstate.h.
 ; XPAD_COOKIE, XPAD_JAR and the rest of the ABI come from the xpad
 ; submodule, generated from xpad.h by `make inc` there, so they cannot
 ; be transcribed wrongly here. See the -I in the Makefile.
+;
+; Consumers do not read it there. The cookie points at res_block, a copy in
+; the resident's RAM that do_xpad brings up to date on every tick, so a game
+; reads ST RAM, as it does from COMpad, and never the cartridge port.
+; Flashback froze on real hardware when it was skipped with a pad reading
+; the window directly, under VBL and ETV, at 8 MHz with no cache, with four
+; pads and in an older single-pad release; it never did in Hatari, and never with COMpad.
+; With no RAM block (Malloc failed) the cookie points at the window.
     include "xpad.inc"
 
 XPAD_BLOCK          equ $FA2300     ; the block itself, in the cartridge window
-; The block's req pointer, which the RP fills in from APP_XPAD_REQ_ADDR.
 ; xpad.inc stops at XPAD_HDR_FIXED because pointer sizes differ between
-; machines; on the m68k provider then req follow it, 4 bytes each. Pinned
-; on the RP side by a _Static_assert on OFF_REQ in xpadstate.c.
-XPAD_REQ_PTR_ADDR   equ (XPAD_BLOCK+XPAD_HDR_FIXED+4)
+; machines; on the m68k, provider then req follow it, 4 bytes each, then
+; the pads. Pinned on the RP side by _Static_asserts in xpadstate.c.
+XB_PROVIDER         equ XPAD_HDR_FIXED          ; .l provider name
+XB_REQ              equ (XPAD_HDR_FIXED+4)      ; .l request area
+XB_PADS             equ (XPAD_HDR_FIXED+8)      ; pads_offset
+XB_PADS_LEN         equ (4*XPAD_PAD_SIZE_V1)    ; one buffer: four pads
+XB_SIZE             equ (XB_PADS+2*XB_PADS_LEN) ; hdr_size: both buffers
+XB_NAME_LEN         equ 32                      ; XPADSTATE_PROVIDER_SIZE
+; The block's req pointer, which the RP fills in from APP_XPAD_REQ_ADDR.
+XPAD_REQ_PTR_ADDR   equ (XPAD_BLOCK+XB_REQ)
 
 ; -----------------------------------------------------------------------
 ; Installer — runs from ROM at USERFW ($FA0800). Only writes to RAM.
@@ -170,6 +182,9 @@ userfw:
     tst.b   XPAD_FLAG_ADDR
     beq.s   .uf_hook
     bsr     req_handshake
+    bsr     mirror_block
+    lea     (res_block-resident_start)(a3), a0
+    move.l  a0, d1                  ; the cookie points at the RAM copy
     bsr     install_xpad_cookie
 .uf_hook:
 
@@ -214,6 +229,7 @@ userfw:
     ; NULL, so no consumer is offered rumble.
     tst.b   XPAD_FLAG_ADDR
     beq.s   .uf_exit
+    move.l  #XPAD_BLOCK, d1         ; nowhere to copy it: the window itself
     bsr     install_xpad_cookie
 
 .uf_exit:
@@ -265,8 +281,45 @@ req_handshake:
     rts
 
 ; -----------------------------------------------------------------------
-; Point the XPAD cookie at the block in the window, so any Xpad-aware
-; program can find the controller without going near joyvec.
+; Copy the RP's block into res_block, and its provider name into
+; res_provider, then point both pointers into RAM. req is our request area
+; if the handshake confirmed it and NULL otherwise, with XPAD_CAP_RUMBLE to
+; match. From here do_xpad keeps the pads current. Runs after the
+; handshake, so the copied caps already say what the RP knows. In: a3 =
+; RAM block. Clobbers d0/a0-a2.
+; -----------------------------------------------------------------------
+mirror_block:
+    lea     XPAD_BLOCK, a0
+    lea     (res_block-resident_start)(a3), a1
+    move.w  #(XB_SIZE/2-1), d0
+.mb_copy:
+    move.w  (a0)+, (a1)+            ; header and both buffers
+    dbf     d0, .mb_copy
+    lea     (res_block-resident_start)(a3), a1
+    move.l  XB_PROVIDER(a1), a0     ; the name, in the window
+    lea     (res_provider-resident_start)(a3), a2
+    move.l  a2, XB_PROVIDER(a1)
+    moveq   #(XB_NAME_LEN-1), d0
+.mb_name:
+    move.b  (a0)+, (a2)+
+    dbf     d0, .mb_name
+    clr.l   XB_REQ(a1)
+    and.w   #($FFFF-XPAD_CAP_RUMBLE), XPAD_CAPS_OFF(a1)
+    tst.b   (res_rq-resident_start+RQ_ON)(a3)
+    beq.s   .mb_on
+    lea     (res_req-resident_start)(a3), a2
+    move.l  a2, XB_REQ(a1)
+    or.w    #XPAD_CAP_RUMBLE, XPAD_CAPS_OFF(a1)
+.mb_on:
+    lea     (res_xm-resident_start)(a3), a2
+    move.w  XPAD_SEQ_OFF(a1), XM_SEEN(a2)   ; the copy is current
+    move.b  #1, XM_ON(a2)
+    rts
+
+; -----------------------------------------------------------------------
+; Point the XPAD cookie at the block in d1 (res_block, or the window when
+; there is no RAM block), so any Xpad-aware program can find the controller
+; without going near joyvec.
 ;
 ; The jar is pairs of (id, value) ending in a (0, slots_remaining)
 ; terminator. Replace an existing entry, otherwise append if there is room.
@@ -274,7 +327,7 @@ req_handshake:
 ; variable at $5A0 is legal to touch here.
 ;
 ; Silently does nothing when there is no jar at all, which is TOS 1.0 and
-; nothing else. Clobbers d0/a0, both saved by the caller.
+; nothing else. In: d1 = block. Clobbers d0/a0, both saved by the caller.
 ; -----------------------------------------------------------------------
 install_xpad_cookie:
     move.l  XPAD_JAR.w, d0
@@ -290,7 +343,7 @@ install_xpad_cookie:
     bra.s   .xc_scan
 
 .xc_replace:
-    move.l  #XPAD_BLOCK, 4(a0)
+    move.l  d1, 4(a0)
     rts
 
 .xc_append:
@@ -303,7 +356,7 @@ install_xpad_cookie:
     subq.l  #1, d0
     move.l  d0, 12(a0)
     move.l  #XPAD_COOKIE, (a0)
-    move.l  #XPAD_BLOCK, 4(a0)
+    move.l  d1, 4(a0)
 
 .xc_done:
     rts
@@ -423,7 +476,50 @@ do_inject:
     jsr     (a1)                    ; mousevec convention: a0 -> [header, dx, dy]
     move.w  (sp)+, sr
 .di_done:
+    bsr.s   do_xpad
     bsr     do_rumble
+    rts
+
+    even
+; do_xpad — bring res_block up to date with the RP's block. The RP commits a
+; new front buffer every 20 ms, seq then active; this copies that buffer into
+; res_block's back buffer and commits it the same way, so a consumer reading
+; the copy gets what xpad_read() expects of any provider. A consumer
+; interrupted mid-read sees seq move and reads again. If the RP committed
+; during the copy, the copy is left uncommitted and the next tick redoes it.
+; Free to clobber registers: do_inject's callers saved them all.
+do_xpad:
+    lea     res_xm(pc), a2
+    tst.b   XM_ON(a2)
+    beq.s   .dx_done                ; Xpad off, or no copy made
+    lea     XPAD_BLOCK, a0
+    move.w  XPAD_SEQ_OFF(a0), d2    ; the RP's seq,
+    cmp.w   XM_SEEN(a2), d2
+    beq.s   .dx_done                ; nothing new since the last copy
+    move.b  XPAD_ACTIVE_OFF(a0), d3 ; and the buffer it is showing
+    lea     XB_PADS(a0), a1
+    btst    #0, d3
+    beq.s   .dx_from
+    lea     XB_PADS_LEN(a1), a1
+.dx_from:
+    lea     res_block(pc), a3
+    lea     XB_PADS(a3), a4         ; into whichever of ours is not showing
+    btst    #0, XPAD_ACTIVE_OFF(a3)
+    bne.s   .dx_to
+    lea     XB_PADS_LEN(a4), a4
+.dx_to:
+    moveq   #(XB_PADS_LEN/4-1), d0
+.dx_copy:
+    move.l  (a1)+, (a4)+
+    dbf     d0, .dx_copy
+    cmp.w   XPAD_SEQ_OFF(a0), d2
+    bne.s   .dx_done                ; the RP moved meanwhile: next tick
+    cmp.b   XPAD_ACTIVE_OFF(a0), d3
+    bne.s   .dx_done
+    addq.w  #1, XPAD_SEQ_OFF(a3)    ; commit: seq first,
+    eori.b  #1, XPAD_ACTIVE_OFF(a3) ; then show the buffer just written
+    move.w  d2, XM_SEEN(a2)
+.dx_done:
     rts
 
     even
@@ -553,6 +649,23 @@ RQ_LAST             equ 4           ; long: _hz_200 at the last frame
 res_rq:
     dc.b    0, 0, 0, 0
     dc.l    0
+    even
+; The Xpad block consumers read, filled in by mirror_block and kept current
+; by do_xpad: laid out as xpad.h's XPAD on the m68k, the header and both
+; buffers of four pads. Its provider pointer is res_provider, and its req
+; pointer res_req.
+res_block:
+    dcb.b   XB_SIZE, 0
+    even
+res_provider:
+    dcb.b   XB_NAME_LEN, 0
+    even
+; do_xpad's state, at these offsets from res_xm.
+XM_ON               equ 0           ; byte: res_block is in use
+XM_SEEN             equ 2           ; word: the RP's seq at the last copy
+res_xm:
+    dc.b    0, 0
+    dc.w    0
     even
 orig_hook:
     dc.l    0                      ; saved original handler at the hooked vector
