@@ -7,7 +7,8 @@
     "Bluetooth",
     "Controller",
     "Gamepad",
-    "Joystick"
+    "Joystick",
+    "Emulation"
   ],
   "devices": [
     "Atari ST",
